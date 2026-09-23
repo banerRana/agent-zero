@@ -1,9 +1,10 @@
 import * as msgs from "/js/messages.js";
 import * as api from "/js/api.js";
+import { callJsExtensions } from "/js/extensions.js";
 import * as css from "/js/css.js";
 import { sleep } from "/js/sleep.js";
+import { ttsService } from "/js/tts-service.js";
 import { store as attachmentsStore } from "/components/chat/attachments/attachmentsStore.js";
-import { store as speechStore } from "/components/chat/speech/speech-store.js";
 import { store as notificationStore } from "/components/notifications/notification-store.js";
 import { store as preferencesStore } from "/components/sidebar/bottom/preferences/preferences-store.js";
 import { store as inputStore } from "/components/chat/input/input-store.js";
@@ -13,6 +14,10 @@ import { store as chatTopStore } from "/components/chat/top-section/chat-top-sto
 import { store as _tooltipsStore } from "/components/tooltips/tooltip-store.js";
 import { store as messageQueueStore } from "/components/chat/message-queue/message-queue-store.js";
 import { store as syncStore } from "/components/sync/sync-store.js"
+import { store as welcomeStore } from "/components/welcome/welcome-store.js";
+import { store as modelGateStore } from "/components/chat/model-gate-store.js";
+import { getUserHour12, getUserTimezone } from "/js/time-utils.js";
+import { createThreeBubbleLoader } from "/js/loading-indicators.js";
 
 globalThis.fetchApi = api.fetchApi; // TODO - backward compatibility for non-modular scripts, remove once refactored to alpine
 
@@ -21,7 +26,6 @@ let leftPanel,
   rightPanel,
   container,
   chatInput,
-  chatHistory,
   sendButton,
   inputSection,
   statusSection,
@@ -31,16 +35,71 @@ let leftPanel,
 
 let autoScroll = true;
 let context = null;
+let loadingContext = null;
+let chatLoadingSplashVisible = false;
+let chatLoadingSplashTimer = null;
 globalThis.resetCounter = 0; // Used by stores and getChatBasedId
 let skipOneSpeech = false;
+const CHAT_LOADING_SPLASH_DELAY_MS = 300;
+
+function syncChatLoadingSplash() {
+  const splash = document.getElementById("chat-loading-splash");
+  if (!splash) return;
+  if (!splash.querySelector(":scope > .three-bubble-loader")) {
+    splash.prepend(createThreeBubbleLoader({ active: true }));
+  }
+  splash.hidden = !chatLoadingSplashVisible;
+}
+
+function beginChatLoading(id) {
+  if (chatLoadingSplashTimer) {
+    clearTimeout(chatLoadingSplashTimer);
+    chatLoadingSplashTimer = null;
+  }
+  loadingContext = id || null;
+  chatLoadingSplashVisible = false;
+  syncChatLoadingSplash();
+
+  if (loadingContext !== null) {
+    const expectedContext = loadingContext;
+    chatLoadingSplashTimer = setTimeout(() => {
+      chatLoadingSplashTimer = null;
+      if (loadingContext !== expectedContext) return;
+      chatLoadingSplashVisible = true;
+      syncChatLoadingSplash();
+    }, CHAT_LOADING_SPLASH_DELAY_MS);
+  }
+}
+
+function finishChatLoading(id) {
+  if (loadingContext === null || id !== loadingContext) return;
+  if (chatLoadingSplashTimer) {
+    clearTimeout(chatLoadingSplashTimer);
+    chatLoadingSplashTimer = null;
+  }
+  loadingContext = null;
+  chatLoadingSplashVisible = false;
+  syncChatLoadingSplash();
+}
 
 // Sidebar toggle logic is now handled by sidebar-store.js
 
-export async function sendMessage() {
+export async function sendMessage(options = {}) {
   try {
-    const message = inputStore.message.trim();
-    const attachmentsWithUrls = attachmentsStore.getAttachmentsForSending();
-    const hasAttachments = attachmentsWithUrls.length > 0;
+    const hasProvidedMessage = Object.prototype.hasOwnProperty.call(options, "message");
+    let message = String(hasProvidedMessage ? options.message : inputStore.message).trim();
+    let attachmentsWithUrls = options.attachments || attachmentsStore.getAttachmentsForSending();
+    let hasAttachments = attachmentsWithUrls.length > 0;
+
+    const sendCtx = { message, attachments: attachmentsWithUrls, context: options.context || context, cancel: false };
+    if (!options.skipExtensions) await callJsExtensions("send_message_before", sendCtx);
+    if (sendCtx.cancel) return;
+    message = sendCtx.message;
+    attachmentsWithUrls = sendCtx.attachments;
+    hasAttachments = attachmentsWithUrls.length > 0;
+    const sendContext = options.context || context;
+    const messageId = options.messageId || generateGUID();
+    const shouldResetInput = !hasProvidedMessage && !options.preserveInput;
 
     // If empty input but has queued messages, send all queued
     if (!message && !hasAttachments && messageQueueStore.hasQueue) {
@@ -49,12 +108,31 @@ export async function sendMessage() {
     }
 
     if (message || hasAttachments) {
+      if (!options.bypassModelGate && !(await modelGateStore.canSendToModel())) {
+        modelGateStore.start({
+          message,
+          attachments: attachmentsWithUrls,
+          messageId,
+          context: sendContext,
+        });
+
+        if (shouldResetInput) {
+          inputStore.reset();
+          adjustTextareaHeight();
+        }
+
+        await setMessages(modelGateStore.syntheticMessages(sendContext));
+        forceScrollChatToBottom();
+        return;
+      }
+
       // Check if agent is busy - queue instead of sending
-      if (chatsStore.selectedContext.running || messageQueueStore.hasQueue) {
+      if (chatsStore.selectedContext?.running || messageQueueStore.hasQueue) {
         const success = messageQueueStore.addToQueue(message, attachmentsWithUrls);
         // no await for the queue
         // if (success) {
-          inputStore.reset();
+          if (shouldResetInput) inputStore.reset();
+          adjustTextareaHeight();
         // }
         return;
       }
@@ -64,29 +142,25 @@ export async function sendMessage() {
       forceScrollChatToBottom();
 
       let response;
-      const messageId = generateGUID();
 
       // Clear input and attachments
-      inputStore.reset();
+      if (shouldResetInput) {
+        inputStore.reset();
+        adjustTextareaHeight();
+      }
+
+      // Render immediately; the backend log reuses messageId and merges into this row.
+      const heading = hasAttachments ? "Uploading attachments..." : "";
+      await setMessages([{ id: messageId, type: "user", heading, content: message, kvps: {} }]);
 
       // Include attachments in the user message
       if (hasAttachments) {
-        const heading =
-          attachmentsWithUrls.length > 0
-            ? "Uploading attachments..."
-            : "";
-
-        // Render user message with attachments
-        setMessages([{ id: messageId, type: "user", heading, content: message, kvps: {
-          // attachments: attachmentsWithUrls, // skip here, let the backend properly log them
-        }}]);
-
         // sleep one frame to render the message before upload starts - better UX
         sleep(0);
 
         const formData = new FormData();
         formData.append("text", message);
-        formData.append("context", context);
+        formData.append("context", sendContext);
         formData.append("message_id", messageId);
 
         for (let i = 0; i < attachmentsWithUrls.length; i++) {
@@ -101,7 +175,7 @@ export async function sendMessage() {
         // For text-only messages
         const data = {
           text: message,
-          context,
+          context: sendContext,
           message_id: messageId,
         };
         response = await api.fetchApi("/message_async", {
@@ -127,14 +201,8 @@ export async function sendMessage() {
 }
 globalThis.sendMessage = sendMessage;
 
-function getChatHistoryEl() {
-  return document.getElementById("chat-history");
-}
-
 function forceScrollChatToBottom() {
-  const chatHistoryEl = getChatHistoryEl();
-  if (!chatHistoryEl) return;
-  chatHistoryEl.scrollTop = chatHistoryEl.scrollHeight;
+  return msgs.scrollMessageWindowToEdge("end");
 }
 globalThis.forceScrollChatToBottom = forceScrollChatToBottom;
 
@@ -161,23 +229,23 @@ globalThis.toastFetchError = toastFetchError;
 // Event listeners will be set up in DOMContentLoaded
 
 export function updateChatInput(text) {
-  const chatInputEl = document.getElementById("chat-input");
-  if (!chatInputEl) {
-    console.warn("`chatInput` element not found, cannot update.");
+  if (!inputStore) {
+    console.warn("`chatInput` store not found, cannot update.");
     return;
   }
   console.log("updateChatInput called with:", text);
 
-  // Append text with proper spacing
-  const currentValue = chatInputEl.value;
+  // Append text with proper spacing in Alpine store first.
+  const currentValue = inputStore.message || "";
   const needsSpace = currentValue.length > 0 && !currentValue.endsWith(" ");
-  chatInputEl.value = currentValue + (needsSpace ? " " : "") + text + " ";
+  inputStore.message = currentValue + (needsSpace ? " " : "") + text + " ";
 
-  // Adjust height and trigger input event
-  adjustTextareaHeight();
-  chatInputEl.dispatchEvent(new Event("input"));
+  // Adjust height after Alpine applies store value.
+  setTimeout(() => {
+    adjustTextareaHeight();
+  }, 0);
 
-  console.log("Updated chat input value:", chatInputEl.value);
+  console.log("Updated chat input value:", inputStore.message);
 }
 
 async function updateUserTime() {
@@ -189,20 +257,21 @@ async function updateUserTime() {
   }
 
   const now = new Date();
-  const hours = now.getHours();
-  const minutes = now.getMinutes();
-  const seconds = now.getSeconds();
-  const ampm = hours >= 12 ? "pm" : "am";
-  const formattedHours = hours % 12 || 12;
-
-  // Format the time
-  const timeString = `${formattedHours}:${minutes
-    .toString()
-    .padStart(2, "0")}:${seconds.toString().padStart(2, "0")} ${ampm}`;
-
-  // Format the date
-  const options = { year: "numeric", month: "short", day: "numeric" };
-  const dateString = now.toLocaleDateString(undefined, options);
+  const timezone = getUserTimezone();
+  const hour12 = getUserHour12();
+  const timeString = new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12,
+    timeZone: timezone,
+  }).format(now).toLowerCase();
+  const dateString = new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    timeZone: timezone,
+  }).format(now);
 
   // Update the HTML
   userTimeElement.innerHTML = `${timeString}<br><span id="user-date">${dateString}</span>`;
@@ -211,8 +280,8 @@ async function updateUserTime() {
 updateUserTime();
 setInterval(updateUserTime, 1000);
 
-function setMessages(...params) {
-  return msgs.setMessages(...params);
+async function setMessages(...params) {
+  return await msgs.setMessages(...params);
 }
 
 globalThis.loadKnowledge = async function () {
@@ -220,11 +289,7 @@ globalThis.loadKnowledge = async function () {
 };
 
 function adjustTextareaHeight() {
-  const chatInputEl = document.getElementById("chat-input");
-  if (chatInputEl) {
-    chatInputEl.style.height = "auto";
-    chatInputEl.style.height = chatInputEl.scrollHeight + "px";
-  }
+  inputStore.adjustTextareaHeight();
 }
 
 export const sendJsonData = async function (url, data) {
@@ -278,12 +343,13 @@ let lastSpokenNo = 0;
 
 export function buildStateRequestPayload(options = {}) {
   const { forceFull = false } = options || {};
-  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const timezone = getUserTimezone();
   return {
     context: context || null,
     log_from: forceFull ? 0 : lastLogVersion,
     notifications_from: forceFull ? 0 : notificationStore.lastNotificationVersion || 0,
     timezone,
+    collections_delta: true,
   };
 }
 
@@ -311,13 +377,30 @@ export async function applySnapshot(snapshot, options = {}) {
     return { updated: false };
   }
 
+  const hasCollections =
+    Array.isArray(snapshot.contexts) && Array.isArray(snapshot.tasks);
+  const extensionSnapshot = hasCollections
+    ? snapshot
+    : {
+        ...snapshot,
+        contexts: chatsStore.contexts,
+        tasks: tasksStore.tasks,
+      };
+  const snapCtx = {
+    snapshot: extensionSnapshot,
+    willUpdateMessages: lastLogVersion != snapshot.log_version,
+    skip: false,
+  };
+  const applyingContext = context;
+  await callJsExtensions("apply_snapshot_before", snapCtx);
+  if (snapCtx.skip || context !== applyingContext) return { updated: false };
+
   // If the chat has been reset, reset cursors and request a resync from the caller.
   // Note: on first snapshot after a context switch, lastLogGuid is intentionally empty,
   // so the mismatch is expected and should not trigger a second state_request/poll.
   if (lastLogGuid != snapshot.log_guid) {
     if (lastLogGuid) {
-      const chatHistoryEl = document.getElementById("chat-history");
-      if (chatHistoryEl) chatHistoryEl.innerHTML = "";
+      msgs.resetMessageRenderState();
       lastLogVersion = 0;
       lastLogGuid = snapshot.log_guid;
       if (typeof onLogGuidReset === "function") {
@@ -332,7 +415,11 @@ export async function applySnapshot(snapshot, options = {}) {
 
   if (lastLogVersion != snapshot.log_version) {
     updated = true;
-    setMessages(snapshot.logs);
+    if (snapshot.logs?.[0]?.no === 0) {
+      msgs.resetMessageRenderState();
+    }
+    await setMessages(modelGateStore.mergeSyntheticMessages(snapshot.logs, context));
+    if (context !== applyingContext) return { updated: false };
     afterMessagesUpdate(snapshot.logs);
   }
 
@@ -352,25 +439,25 @@ export async function applySnapshot(snapshot, options = {}) {
     setConnectionStatus(true);
   }
 
-  // Update chats list using store
-  let contexts = snapshot.contexts || [];
-  chatsStore.applyContexts(contexts);
+  if (hasCollections) {
+    // Update chats list using store
+    chatsStore.applyContexts(snapshot.contexts);
 
-  // Update tasks list using store
-  let tasks = snapshot.tasks || [];
-  tasksStore.applyTasks(tasks);
+    // Update tasks list using store
+    tasksStore.applyTasks(snapshot.tasks);
 
-  // Make sure the active context is properly selected in both lists
-  if (context) {
-    // Update selection in both stores
-    chatsStore.setSelected(context);
+    // Make sure the active context is properly selected in both lists
+    // Leave an empty selection unchanged so the welcome screen stays visible.
+    if (context) {
+      // Update selection in both stores
+      chatsStore.setSelected(context);
 
-    const contextInChats = chatsStore.contains(context);
-    const contextInTasks = tasksStore.contains(context);
+      const contextInChats = chatsStore.contains(context);
+      const contextInTasks = tasksStore.contains(context);
 
-    if (contextInTasks) {
-      tasksStore.setSelected(context);
-    }
+      if (contextInTasks) {
+        tasksStore.setSelected(context);
+      }
 
       if (!contextInChats && !contextInTasks) {
         if (chatsStore.contexts.length > 0) {
@@ -385,20 +472,22 @@ export async function applySnapshot(snapshot, options = {}) {
           deselectChat();
         }
       }
-    } else {
-      // No context selected: keep it that way so the welcome screen stays visible.
     }
-
-    // update message queue
-    messageQueueStore.updateFromPoll();
-
-    return { updated };
   }
+
+  // update message queue
+  messageQueueStore.updateFromPoll();
+
+  // A context switch is visually complete only after its matching snapshot
+  // has rendered and the surrounding chat state has been synchronized.
+  finishChatLoading(snapshot.context);
+
+  return { updated };
+}
 
 export async function poll() {
   try {
-    // Get timezone from navigator
-    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const timezone = getUserTimezone();
 
     const log_from = lastLogVersion;
     const response = await sendJsonData("/poll", {
@@ -440,7 +529,7 @@ function speakMessages(logs) {
     // finished response
     if (log.type == "response") {
       // lastSpokenNo = log.no;
-      speechStore.speakStream(
+      ttsService.speakStream(
         getChatBasedId(log.no),
         log.content,
         log.kvps?.finished
@@ -456,23 +545,40 @@ function speakMessages(logs) {
       log.kvps.tool_name != "response"
     ) {
       // lastSpokenNo = log.no;
-      speechStore.speakStream(getChatBasedId(log.no), log.kvps.headline, true);
+      ttsService.speakStream(getChatBasedId(log.no), log.kvps.headline, true);
       return;
     }
   }
 }
 
 function updateProgress(progress, active) {
-  const progressBarEl = document.getElementById("progress-bar");
-  if (!progressBarEl) return;
   if (!progress) progress = "";
 
-  setProgressBarShine(progressBarEl, active);
+  // Strip HTML tags for plain-text placeholder use
+  const plainText = progress.replace(/<[^>]*>/g, "").trim();
 
-  progress = msgs.convertIcons(progress);
+  // Update the input store so the placeholder reflects progress
+  inputStore.progressText = plainText;
+  inputStore.progressActive = !!active;
 
-  if (progressBarEl.innerHTML != progress) {
-    progressBarEl.innerHTML = progress;
+  // Apply shimmer class to the textarea when active
+  const chatInputEl = document.getElementById("chat-input");
+  if (chatInputEl) {
+    if (active && plainText) {
+      addClassToElement(chatInputEl, "progress-active");
+    } else {
+      removeClassFromElement(chatInputEl, "progress-active");
+    }
+  }
+
+  // Also update legacy progress bar element if it still exists
+  const progressBarEl = document.getElementById("progress-bar");
+  if (progressBarEl) {
+    setProgressBarShine(progressBarEl, active);
+    const html = msgs.convertIcons(progress);
+    if (progressBarEl.innerHTML != html) {
+      progressBarEl.innerHTML = html;
+    }
   }
 }
 
@@ -507,7 +613,10 @@ globalThis.newContext = newContext;
 
 export const setContext = function (id) {
   if (id == context) return;
+  inputStore.setDraftContext(id);
   context = id;
+  if (id) beginChatLoading(id);
+  else beginChatLoading(null);
   // Always reset the log tracking variables when switching contexts
   // This ensures we get fresh data from the backend
   lastLogGuid = "";
@@ -515,11 +624,10 @@ export const setContext = function (id) {
   lastSpokenNo = 0;
 
   // Stop speech when switching chats
-  speechStore.stopAudio();
+  ttsService.stop();
 
   // Clear the chat history immediately to avoid showing stale content
-  const chatHistoryEl = document.getElementById("chat-history");
-  if (chatHistoryEl) chatHistoryEl.innerHTML = "";
+  msgs.resetMessageRenderState();
 
   // Update both selected states using stores
   chatsStore.setSelected(id);
@@ -539,6 +647,13 @@ export const setContext = function (id) {
 
   //skip one speech if enabled when switching context
   if (preferencesStore.speech) skipOneSpeech = true;
+
+  // Focus the chat input
+  if (id) {
+    setTimeout(() => {
+      inputStore.focus();
+    }, 50);
+  }
 };
 
 export const deselectChat = function () {
@@ -550,7 +665,7 @@ export const deselectChat = function () {
   sessionStorage.removeItem("lastSelectedTask");
 
   // Clear the chat history
-  chatHistory.innerHTML = "";
+  msgs.resetMessageRenderState();
 };
 globalThis.deselectChat = deselectChat;
 
@@ -725,13 +840,13 @@ document.addEventListener("DOMContentLoaded", function () {
   rightPanel = document.getElementById("right-panel");
   container = document.querySelector(".container");
   chatInput = document.getElementById("chat-input");
-  chatHistory = document.getElementById("chat-history");
   sendButton = document.getElementById("send-button");
   inputSection = document.getElementById("input-section");
   statusSection = document.getElementById("status-section");
   progressBar = document.getElementById("progress-bar");
   autoScrollSwitch = document.getElementById("auto-scroll-switch");
   timeDate = document.getElementById("time-date-container");
+  syncChatLoadingSplash();
 
 
   // Start polling for updates

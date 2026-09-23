@@ -4,6 +4,7 @@
 **/__pycache__/
 *.py[cod]
 **/.conda/
+**/node_modules/
 
 #Ignore IDE files
 .cursor/
@@ -16,21 +17,27 @@
 .venv/
 
 # obsolete folders
-memory/
-knowledge/custom/
-instruments/
-
-# Handle logs directory
-logs/**
-!logs/**/
+/memory/
+/knowledge/custom/
+/instruments/
+/logs/
 
 # Handle tmp and usr directory
 tmp/**
 !tmp/**/
-usr/**
-!usr/**/
 
-# Handle knowledge directory
+# hack to keep .gitkeep but ignore nested repos
+# Ignore everything under usr
+usr/**
+# Ignore nested repos
+/usr/**/.git
+# Allow git to traverse directories
+!usr/**/
+# Re-ignore everything again
+usr/**/*
+# But allow .gitkeep files
+!usr/**/.gitkeep
+
 
 # Global rule to include .gitkeep files anywhere
 !**/.gitkeep
@@ -40,3 +47,4 @@ agent_history.gif
 
 .agent/**
 .claude/**
+.playwright-cli/

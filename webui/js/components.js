@@ -30,8 +30,7 @@ export async function importComponent(path, targetElement) {
     targetElement.innerHTML = '<div class="loading"></div>';
 
     // full component url
-    const trimmedPath = path.replace(/^\/+/, "");
-    const componentUrl = trimmedPath.startsWith("components/") ? trimmedPath : "components/" + trimmedPath;
+    const componentUrl = path.startsWith("/") ? path : (path.startsWith("components/") ? path : "components/" + path);
 
     // get html from cache or fetch it
     let html;
@@ -51,13 +50,16 @@ export async function importComponent(path, targetElement) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
 
+    const componentAssetSelector = "style, script, link[rel='stylesheet']";
     const allNodes = [
-      ...doc.querySelectorAll("style"),
-      ...doc.querySelectorAll("script"),
-      ...doc.body.childNodes,
+      ...doc.querySelectorAll(componentAssetSelector),
+      ...Array.from(doc.body.childNodes).filter(
+        (node) => !node.matches?.(componentAssetSelector)
+      ),
     ];
 
     const loadPromises = [];
+    const deferredNodes = [];
     let blobCounter = 0;
 
     for (const node of allNodes) {
@@ -77,8 +79,8 @@ export async function importComponent(path, targetElement) {
             if (!componentCache[resolvedUrl]) {
               const modulePromise = import(resolvedUrl);
               componentCache[resolvedUrl] = modulePromise;
-              loadPromises.push(modulePromise);
             }
+            loadPromises.push(componentCache[resolvedUrl]);
           } else {
             const virtualUrl = `${componentUrl.replaceAll(
               "/",
@@ -114,14 +116,14 @@ export async function importComponent(path, targetElement) {
 
               const modulePromise = import(blobUrl)
                 .catch((err) => {
-                  console.error("Failed to load inline module", err);
+                  console.error(`Failed to load inline module ${virtualUrl}:`, err);
                   throw err;
                 })
                 .finally(() => URL.revokeObjectURL(blobUrl));
 
               componentCache[virtualUrl] = modulePromise;
-              loadPromises.push(modulePromise);
             }
+            loadPromises.push(componentCache[virtualUrl]);
           }
         } else {
           // Non-module script
@@ -157,13 +159,16 @@ export async function importComponent(path, targetElement) {
 
         targetElement.appendChild(clone);
       } else {
-        const clone = node.cloneNode(true);
-        targetElement.appendChild(clone);
+        deferredNodes.push(node.cloneNode(true));
       }
     }
 
     // Wait for all tracked external scripts/styles to finish loading
     await Promise.all(loadPromises);
+
+    for (const deferred of deferredNodes) {
+      targetElement.appendChild(deferred);
+    }
 
     // Remove loading indicator
     const loadingEl = targetElement.querySelector(':scope > .loading');

@@ -1,6 +1,7 @@
 import { createStore } from "/js/AlpineStore.js";
 import * as API from "/js/api.js";
 import { openModal } from "/js/modals.js";
+import { formatDateTime, getCurrentUserISOString } from "/js/time-utils.js";
 
 export const NotificationType = {
   INFO: "info",
@@ -19,9 +20,20 @@ export const defaultPriority = NotificationPriority.NORMAL;
 
 const maxNotifications = 100;
 const maxToasts = 5;
+const toastIdPrefix = "toast-";
+
+// Notification action buttons are authored against the toast-stack scope, but the
+// same message HTML is also rendered inside the notifications modal. Resolve the
+// underlying notification ID from either surface so actions keep working there.
+const notificationIdFromToastId = (toastId) => {
+  if (typeof toastId !== "string" || !toastId.trim()) return "";
+  return toastId.startsWith(toastIdPrefix)
+    ? toastId.slice(toastIdPrefix.length)
+    : toastId;
+};
 
 const model = {
-  notifications: [],
+  notifications: Array(),
   loading: false,
   lastNotificationVersion: 0,
   lastNotificationGuid: "",
@@ -29,7 +41,7 @@ const model = {
   unreadPrioCount: 0,
 
   // NEW: Toast stack management
-  toastStack: [],
+  toastStack: Array(),
 
   init() {
     this.initialize();
@@ -70,11 +82,26 @@ const model = {
         // adjust notification data before adding
         this.adjustNotificationData(notification);
 
-        const isNew = !this.notifications.find((n) => n.id === notification.id);
+        const existingNotificationIndex = this.notifications.findIndex(
+          (n) => n.id === notification.id
+        );
+        const existingNotification =
+          existingNotificationIndex >= 0
+            ? this.notifications[existingNotificationIndex]
+            : null;
+        const isNew = !existingNotification;
+        const shouldRetoast =
+          !!existingNotification &&
+          shouldToast &&
+          (existingNotification.timestamp !== notification.timestamp ||
+            existingNotification.title !== notification.title ||
+            existingNotification.message !== notification.message ||
+            existingNotification.detail !== notification.detail);
+
         this.addOrUpdateNotification(notification);
 
-        // Add new unread notifications to toast stack
-        if (isNew && shouldToast) {
+        // Add new unread notifications to toast stack, and also re-toast updated unread notifications
+        if ((isNew && shouldToast) || shouldRetoast) {
           this.addToToastStack(notification);
         }
       });
@@ -94,6 +121,15 @@ const model = {
     if (!notification.priority) {
       notification.priority = defaultPriority;
     }
+  },
+
+  getToastDisplayTime(toast) {
+    const displayTime = Number(toast?.display_time);
+    return Number.isFinite(displayTime) ? displayTime : 3;
+  },
+
+  isPersistentToast(toast) {
+    return this.getToastDisplayTime(toast) <= 0;
   },
 
   // NEW: Add notification to toast stack
@@ -125,9 +161,33 @@ const model = {
     }
 
     // Set auto-dismiss timer
+    this.restartToastTimer(toast.toastId);
+  },
+
+  clearToastTimer(toastId) {
+    const toastIndex = this.toastStack.findIndex((t) => t.toastId === toastId);
+    if (toastIndex < 0) return;
+
+    const toast = this.toastStack[toastIndex];
+    if (this.isPersistentToast(toast)) return;
+
+    if (toast.autoRemoveTimer) {
+      clearTimeout(toast.autoRemoveTimer);
+      toast.autoRemoveTimer = null;
+    }
+  },
+
+  restartToastTimer(toastId) {
+    const toastIndex = this.toastStack.findIndex((t) => t.toastId === toastId);
+    if (toastIndex < 0) return;
+
+    const toast = this.toastStack[toastIndex];
+    if (this.isPersistentToast(toast)) return;
+
+    this.clearToastTimer(toastId);
     toast.autoRemoveTimer = setTimeout(() => {
       this.removeFromToastStack(toast.toastId);
-    }, notification.display_time * 1000);
+    }, this.getToastDisplayTime(toast) * 1000);
   },
 
   // NEW: Remove toast from stack
@@ -137,6 +197,7 @@ const model = {
       const toast = this.toastStack[index];
       if (toast.autoRemoveTimer) {
         clearTimeout(toast.autoRemoveTimer);
+        toast.autoRemoveTimer = null;
       }
       this.toastStack.splice(index, 1);
 
@@ -147,7 +208,26 @@ const model = {
 
   // called by UI
   dismissToast(toastId) {
-    this.removeFromToastStack(toastId, true);
+    const toast = this.toastStack.find((t) => t.toastId === toastId);
+    if (toast) {
+      this.removeFromToastStack(toastId, true);
+      return;
+    }
+    // Clicked from the notifications modal: no toast to remove, but still
+    // mirror the toast dismissal by marking the notification as read.
+    const notificationId = notificationIdFromToastId(toastId);
+    if (notificationId) this.markAsRead(notificationId);
+  },
+
+  async dismissToastAndReload(toastId) {
+    const toast = this.toastStack.find((item) => item.toastId === toastId);
+    const notificationId = toast?.id || notificationIdFromToastId(toastId);
+    if (!notificationId) return;
+
+    const response = await API.callJsonApi("notifications_mark_read", {
+      notification_ids: [notificationId],
+    });
+    if (response?.success) window.location.reload();
   },
 
   async afterToastRemoved(toast, removedByUser = false) {
@@ -162,8 +242,9 @@ const model = {
     this.toastStack.forEach((toast) => {
       if (toast.autoRemoveTimer) {
         clearTimeout(toast.autoRemoveTimer);
-        if (withCallback) this.afterToastRemoved(toast, removedByUser);
+        toast.autoRemoveTimer = null;
       }
+      if (withCallback) this.afterToastRemoved(toast, removedByUser);
     });
     this.toastStack = [];
   },
@@ -172,8 +253,11 @@ const model = {
   cleanupExpiredToasts() {
     const now = Date.now();
     this.toastStack = this.toastStack.filter((toast) => {
+      if (this.isPersistentToast(toast)) {
+        return true;
+      }
       const age = now - toast.addedAt;
-      const maxAge = toast.display_time * 1000;
+      const maxAge = this.getToastDisplayTime(toast) * 1000;
 
       if (age > maxAge) {
         if (toast.autoRemoveTimer) {
@@ -186,7 +270,21 @@ const model = {
   },
 
   // NEW: Handle toast click (opens modal)
-  async handleToastClick(toastId) {
+  async handleToastClick(toastId, event) {
+    const target = event?.target;
+    const toast = this.toastStack.find((t) => t.toastId === toastId);
+    if (
+      target instanceof Element &&
+      target.closest(
+        'button, a, input, select, textarea, summary, label, [role="button"], [data-toast-interactive]'
+      )
+    ) {
+      if (toast?.id) {
+        this.markAsRead(toast.id);
+      }
+      return;
+    }
+
     await this.openModal();
     // Modal opening will clear toast stack via markAllAsRead
   },
@@ -341,7 +439,7 @@ const model = {
     else if (diffHours < 24) return `${Math.round(diffHours)}h ago`;
     else if (diffDays < 7) return `${Math.round(diffDays)}d ago`;
 
-    return date.toLocaleDateString();
+    return formatDateTime(timestamp, "date");
   },
 
   // Get CSS class for notification type
@@ -373,7 +471,7 @@ const model = {
       progress: "hourglass_empty",
     };
     const iconName = icons[type] || "info";
-    return `<span class="material-symbols-outlined">${iconName}</span>`;
+    return `<x-icon name="${iconName}"></x-icon>`;
   },
 
   // Create notification via backend (will appear via polling)
@@ -548,7 +646,7 @@ const model = {
     group = "",
     priority = defaultPriority
   ) {
-    const timestamp = new Date().toISOString();
+    const timestamp = getCurrentUserISOString();
     const notification = {
       id: `frontend-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       type: type,
@@ -574,10 +672,7 @@ const model = {
 
       if (existingToastIndex >= 0) {
         const existingToast = this.toastStack[existingToastIndex];
-        if (existingToast.autoRemoveTimer) {
-          clearTimeout(existingToast.autoRemoveTimer);
-        }
-        this.toastStack.splice(existingToastIndex, 1);
+        this.removeFromToastStack(existingToast.toastId);
       }
     }
 
@@ -587,6 +682,8 @@ const model = {
       toastId: `toast-${notification.id}`,
       addedAt: Date.now(),
       autoRemoveTimer: null,
+      hoverTimer: null,
+      isHovered: false,
     };
 
     // Add to bottom of stack (newest at bottom)
@@ -601,9 +698,7 @@ const model = {
     }
 
     // Set auto-dismiss timer
-    toast.autoRemoveTimer = setTimeout(() => {
-      this.removeFromToastStack(toast.toastId);
-    }, notification.display_time * 1000);
+    this.restartToastTimer(toast.toastId);
 
     return notification.id;
   },

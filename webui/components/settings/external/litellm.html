@@ -9,14 +9,14 @@
         <div>
           <div class="section-title">LiteLLM Global Settings</div>
           <div class="section-description">
-            Configure global parameters passed to LiteLLM for all providers.
+            Provider-wide LiteLLM overrides. These values apply to all LiteLLM calls unless a model overrides them.
           </div>
 
           <div class="field field-full">
             <div class="field-label">
-              <div class="field-title">LiteLLM global parameters</div>
+              <div class="field-title">Global LiteLLM parameters</div>
               <div class="field-description">
-                Global LiteLLM params (e.g. timeout, stream_timeout) in .env format: one KEY=VALUE per line. Example: <code>stream_timeout=30</code>. Applied to all LiteLLM calls unless overridden. See <a href='https://docs.litellm.ai/docs/set_keys' target='_blank'>LiteLLM</a> and <a href='https://docs.litellm.ai/docs/proxy/timeout' target='_blank'>timeouts</a>.
+                One <code>KEY=VALUE</code> pair per line, for example <code>stream_timeout=30</code>.
               </div>
             </div>
             <div class="field-control">

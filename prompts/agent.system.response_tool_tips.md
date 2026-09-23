@@ -1,4 +1,2 @@
-**tips**
-ALWAYS remember to use `§§include(<path>)` replacement to include previous tool results
-rewriting text is slow and expensive, include when possible
-NEVER rewrite subordinate responses
+always deliver the final user-facing answer through this `response` tool's `text` arg
+for long existing text, use `§§include(path)` instead of rewriting

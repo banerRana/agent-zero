@@ -1,36 +1,32 @@
-{{if agent_profiles}}
 ### call_subordinate
-
-you can use subordinates for subtasks
-subordinates can be scientist coder engineer etc
-message field: always describe role, task details goal overview for new subordinate
-delegate specific subtasks not entire task
-reset arg usage:
-  "true": spawn new subordinate
-  "false": continue existing subordinate
-if superior, orchestrate
-respond to existing subordinates using call_subordinate tool with reset false
-profile arg usage: select from available profiles for specialized subordinates, leave empty for default
-
-example usage
+delegate research or complex subtasks to a specialized agent.
+always use specialized subordinate agents for specialized tasks matching their prompt profile
+when a request calls for independent perspectives, challenges, or workstreams, delegate them to separate subordinates instead of performing them all with parent tools
+args: `message`, optional `profile`, `name`, `reset`, `context_id`, `attachments`
+- `profile`: optional prompt profile key for the subordinate; when provided, it must exactly match an available profile; leave empty for the default profile
+- `name`: optional label for the child context, shown in listings; defaults to a short task label for new children; when continuing a child, a non-empty name updates its label
+- `reset`: use json boolean `true` to create a fresh child; use `false` to continue the default child or the supplied `context_id`
+- `context_id`: stable child ID returned by an earlier direct or parallel call; use it with `reset: false` to continue that exact child
+- `attachments`: optional list of file paths/URIs passed to the subordinate's task message so it can read them directly
+- `message`: define role, goal, and the concrete task
+each caller creates its next agent level: A0 creates A1 children, A1 creates A2 children, and so on
+after the subordinate returns, answer from its result directly when it satisfies the user request
+do not repeat the same solving work or call extra tools after a sufficient subordinate result
+example:
 ~~~json
 {
-    "thoughts": [
-        "The result seems to be ok but...",
-        "I will ask a coder subordinate to fix...",
-    ],
-    "tool_name": "call_subordinate",
-    "tool_args": {
-        "profile": "",
-        "message": "...",
-        "reset": "true"
-    }
+  "thoughts": ["Need focused external research before I continue."],
+  "headline": "Delegating research subtask",
+  "tool_name": "call_subordinate",
+  "tool_args": {
+    "profile": "researcher",
+    "message": "Research Italy AI trends and return key findings.",
+    "reset": true
+  }
 }
 ~~~
-
-**response handling**
-- you might be part of long chain of subordinates, avoid slow and expensive rewriting subordinate responses, instead use `§§include(<path>)` alias to include the response as is
-
-**available profiles:**
+reuse long subordinate output with `§§include(path)` instead of rewriting it
+{{if agent_profiles}}
+available profiles:
 {{agent_profiles}}
 {{endif}}

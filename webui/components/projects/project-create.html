@@ -29,7 +29,7 @@
                         <div class="projects-form-group">
                             <label class="projects-form-label">Access Token (optional)</label>
                             <span class="projects-form-description">For private repositories. Token is used only for cloning and will not be stored.</span>
-                            <input class="projects-form-input" type="password" 
+                            <input class="projects-form-input masked-text-input" type="text" autocomplete="off"
                                 x-model="$store.projects.selectedProject.git_token"
                                 :disabled="$store.projects.selectedProject._cloning"
                                 placeholder="ghp_xxxx or glpat-xxxx">
@@ -37,9 +37,6 @@
                     </template>
 
                     <div class="buttons-right">
-                        <button type="button" class="button cancel"
-                            @click="$store.projects.cancelCreate()"
-                            :disabled="$store.projects.selectedProject._cloning">Cancel</button>
                         <button type="button" class="button confirm" 
                             @click="$store.projects.confirmCreate()"
                             :disabled="$store.projects.selectedProject._cloning">
@@ -53,6 +50,9 @@
                                 <span x-text="$store.projects.selectedProject.git_url ? 'Clone and continue' : 'Create and continue'"></span>
                             </template>
                         </button>
+                        <button type="button" class="button cancel"
+                            @click="$store.projects.cancelCreate()"
+                            :disabled="$store.projects.selectedProject._cloning">Cancel</button>
                     </div>
                 </div>
 

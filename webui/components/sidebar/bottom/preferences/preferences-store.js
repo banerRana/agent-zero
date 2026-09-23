@@ -1,10 +1,34 @@
 import { createStore } from "/js/AlpineStore.js";
-import * as css from "/js/css.js";
-import { store as speechStore } from "/components/chat/speech/speech-store.js";
+import { ttsService } from "/js/tts-service.js";
 import { applyModeSteps } from "/components/messages/process-group/process-group-dom.js";
+
+const UI_VISIBILITY_DEFAULTS = {
+  projectSelector: { mobile: true, desktop: true },
+  time: { mobile: false, desktop: true },
+  connectionStatus: { mobile: true, desktop: true },
+  rightCanvasRail: { mobile: true, desktop: true },
+};
+
+function normalizeUiVisibility(value = {}) {
+  return Object.fromEntries(
+    Object.entries({
+      ...Object.fromEntries(Object.keys(value || {}).filter((id) => id.startsWith("canvas:") && id.length > 7)
+        .map((id) => [id, { mobile: true, desktop: true }])),
+      ...UI_VISIBILITY_DEFAULTS,
+    }).map(([control, defaults]) => [
+      control,
+      {
+        mobile: typeof value?.[control]?.mobile === "boolean" ? value[control].mobile : defaults.mobile,
+        desktop: typeof value?.[control]?.desktop === "boolean" ? value[control].desktop : defaults.desktop,
+      },
+    ])
+  );
+}
 
 // Preferences store centralizes user preference toggles and side-effects
 const model = {
+  _initialized: false,
+
   // UI toggles (initialized with safe defaults, loaded from localStorage in init)
   get autoScroll() {
     return this._autoScroll;
@@ -42,6 +66,15 @@ const model = {
   },
   _showUtils: false,
 
+  get showToolArgs() {
+    return this._showToolArgs;
+  },
+  set showToolArgs(value) {
+    this._showToolArgs = value;
+    this._applyShowToolArgs(value);
+  },
+  _showToolArgs: false,
+
   // Chat container width preference for HiDPI/large screens
   get chatWidth() {
     return this._chatWidth;
@@ -70,6 +103,35 @@ const model = {
   },
   _detailMode: "current", // Default: show current step only
 
+  _uiVisibility: normalizeUiVisibility(globalThis.runtimeInfo?.uiControlVisibility),
+  _isMobileViewport: false,
+
+  registerUiControlVisibility(control, defaults = {}) {
+    const id = String(control || "").trim();
+    if (!id) return;
+    UI_VISIBILITY_DEFAULTS[id] = {
+      mobile: defaults.mobile !== false,
+      desktop: defaults.desktop !== false,
+    };
+    this._uiVisibility = normalizeUiVisibility({
+      ...(globalThis.runtimeInfo?.uiControlVisibility || {}),
+      ...(this._uiVisibility || {}),
+    });
+  },
+
+  uiVisibilitySnapshot() {
+    return normalizeUiVisibility(this._uiVisibility);
+  },
+
+  setUiVisibility(value) {
+    this._uiVisibility = normalizeUiVisibility(value);
+  },
+
+  isUiControlVisible(control) {
+    const device = this._isMobileViewport ? "mobile" : "desktop";
+    return this._uiVisibility?.[control]?.[device] !== false;
+  },
+
   // Detail mode options for UI sidebar
   detailModeOptions: [
     { label: "NO", value: "collapsed", title: "All collapsed" },
@@ -80,6 +142,9 @@ const model = {
 
   // Initialize preferences and apply current state
   init() {
+    if (this._initialized) return;
+    this._initialized = true;
+
     try {
       // Load persisted preferences with safe fallbacks
       try {
@@ -124,11 +189,25 @@ const model = {
         this._showUtils = false; // Default to speech off if localStorage is unavailable
       }
 
+      // load tool arguments display preference
+      try {
+        const storedShowToolArgs = localStorage.getItem("showToolArgs");
+        this._showToolArgs = storedShowToolArgs === "true";
+      } catch {
+        this._showToolArgs = false; // Default to hidden if localStorage is unavailable
+      }
+
+      this._isMobileViewport = globalThis.innerWidth <= 768;
+      globalThis.addEventListener("resize", () => {
+        this._isMobileViewport = globalThis.innerWidth <= 768;
+      });
+
       // Apply all preferences
       this._applyDarkMode(this._darkMode);
       this._applyAutoScroll(this._autoScroll);
       this._applySpeech(this._speech);
       this._applyShowUtils(this._showUtils);
+      this._applyShowToolArgs(this._showToolArgs);
       this._applyChatWidth(this._chatWidth);
       this._applyDetailMode(this._detailMode);
     } catch (e) {
@@ -153,17 +232,20 @@ const model = {
 
   _applySpeech(value) {
     localStorage.setItem("speech", value);
-    if (!value) speechStore.stopAudio();
+    if (!value) ttsService.stop();
   },
 
 
   _applyShowUtils(value) {
     localStorage.setItem("showUtils", value);
-    css.toggleCssProperty(
-      ".process-step.message-util",
-      "display",
-      value ? undefined : "none"
+    document.documentElement.classList.toggle(
+      "show-utility-messages",
+      Boolean(value),
     );
+  },
+
+  _applyShowToolArgs(value) {
+    localStorage.setItem("showToolArgs", value);
   },
 
   _applyChatWidth(value) {
@@ -177,10 +259,16 @@ const model = {
     }
   },
 
+  applyCurrentDetailMode(chatHistory = undefined) {
+    return applyModeSteps(this._detailMode, this._showUtils, chatHistory);
+  },
+
   _applyDetailMode(value) {
     localStorage.setItem("detailMode", value);
     // Apply mode to all existing DOM elements
-    applyModeSteps(this._detailMode, this._showUtils);
+    void this.applyCurrentDetailMode().catch((error) => {
+      console.error("Failed to apply process detail mode", error);
+    });
   },
 };
 

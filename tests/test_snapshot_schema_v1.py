@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from python.api.poll import Poll
+from api.poll import Poll
 
 
 EXPECTED_SNAPSHOT_KEYS = {
@@ -59,7 +59,7 @@ async def test_poll_snapshot_matches_contract_schema_key_set_null_context():
 
 @pytest.mark.asyncio
 async def test_snapshot_builder_produces_contract_schema_key_set_and_defaults():
-    from python.helpers import state_snapshot as snapshot
+    from helpers import state_snapshot as snapshot
 
     payload = await snapshot.build_snapshot(
         context=None,
@@ -86,8 +86,54 @@ async def test_snapshot_builder_produces_contract_schema_key_set_and_defaults():
     assert payload["notifications_version"] >= 0
 
 
+@pytest.mark.asyncio
+async def test_negotiated_incremental_snapshot_uses_null_collection_sentinel():
+    from helpers import state_snapshot as snapshot
+
+    request = snapshot.StateRequestV1(
+        context=None,
+        log_from=0,
+        notifications_from=0,
+        timezone="UTC",
+        collections_delta=True,
+    )
+    payload = await snapshot.build_snapshot_from_request(
+        request=request,
+        include_collections=False,
+    )
+
+    snapshot.validate_snapshot_schema_v1(payload)
+    assert set(payload) == EXPECTED_SNAPSHOT_KEYS
+    assert payload["contexts"] is None
+    assert payload["tasks"] is None
+
+
+def test_state_request_collection_delta_is_optional_and_type_checked():
+    from helpers import state_snapshot as snapshot
+
+    base = {
+        "context": None,
+        "log_from": 0,
+        "notifications_from": 0,
+        "timezone": "UTC",
+    }
+
+    assert snapshot.parse_state_request_payload(base).collections_delta is False
+    assert (
+        snapshot.parse_state_request_payload(
+            {**base, "collections_delta": True}
+        ).collections_delta
+        is True
+    )
+    with pytest.raises(snapshot.StateRequestValidationError) as error:
+        snapshot.parse_state_request_payload(
+            {**base, "collections_delta": "yes"}
+        )
+    assert error.value.reason == "collections_delta_type"
+
+
 def test_snapshot_schema_rejects_unexpected_top_level_keys():
-    from python.helpers import state_snapshot as snapshot
+    from helpers import state_snapshot as snapshot
 
     payload = {
         "deselect_chat": False,
@@ -108,3 +154,17 @@ def test_snapshot_schema_rejects_unexpected_top_level_keys():
 
     with pytest.raises(ValueError):
         snapshot.validate_snapshot_schema_v1(payload)
+
+
+def test_notification_payload_and_cursor_are_captured_together():
+    from helpers.notification import NotificationManager, NotificationPriority, NotificationType
+
+    manager = NotificationManager()
+    manager.add_notification(NotificationType.INFO, NotificationPriority.HIGH, "first")
+
+    notifications, _, version = manager.output_with_state()
+    manager.add_notification(NotificationType.INFO, NotificationPriority.HIGH, "second")
+
+    assert [item["message"] for item in notifications] == ["first"]
+    assert version == 1
+    assert [item["message"] for item in manager.output(start=version)] == ["second"]

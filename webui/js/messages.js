@@ -3,15 +3,32 @@ import { store as imageViewerStore } from "../components/modals/image-viewer/ima
 import { marked } from "../vendor/marked/marked.esm.js";
 import { store as _messageResizeStore } from "/components/messages/resize/message-resize-store.js"; // keep here, required in html
 import { store as attachmentsStore } from "/components/chat/attachments/attachmentsStore.js";
-import { store as speechStore } from "/components/chat/speech/speech-store.js";
+import { ttsService } from "/js/tts-service.js";
 import {
   createActionButton,
   copyToClipboard,
+  syncActionButtons,
 } from "/components/messages/action-buttons/simple-action-buttons.js";
 import { store as stepDetailStore } from "/components/modals/process-step-detail/step-detail-store.js";
 import { store as preferencesStore } from "/components/sidebar/bottom/preferences/preferences-store.js";
-import { formatDuration } from "./time-utils.js";
-import { Scroller } from "./scroller.js";
+import {
+  formatDateTime,
+  formatDuration,
+  getUserHour12,
+  getUserTimezone,
+} from "./time-utils.js";
+import { Scroller, cancelPendingScroll } from "./scroller.js";
+import {
+  MessageWindow,
+  PROCESS_STEP_TYPES,
+  classifyMessageRenderUnits,
+  getMessageCacheKey,
+} from "./message-window.js";
+import { callJsExtensions } from "/js/extensions.js";
+import { addBlankTargetsToLinks } from "/js/html-links.js";
+import { sanitizeHtml } from "/js/safe-markdown.js";
+import { createThreeBubbleLoader } from "/js/loading-indicators.js";
+import { measureMessageCollapseOverflow } from "./message-collapse.js";
 
 // Delay before collapsing previous steps when a new step is added
 const STEP_COLLAPSE_DELAY = {
@@ -20,20 +37,115 @@ const STEP_COLLAPSE_DELAY = {
 };
 // delay collapse when hovering
 const STEP_COLLAPSE_HOVER_DELAY_MS = 5000;
+const PROCESS_GROUP_STEP_PAGE_SIZE = 50;
+const PROCESS_GROUP_RENDER_INFO = Symbol("processGroupRenderInfo");
+
+let _messageProcessGroups = new WeakMap();
+let _messageIsProcessStep = new WeakSet();
+let _processStepTypes = PROCESS_STEP_TYPES;
+const _processGroupStepLimits = new Map();
+let _renderedProcessGroupPages = new Map();
+
+function getMessageRenderUnitKeys(messages) {
+  _messageProcessGroups = new WeakMap();
+  _messageIsProcessStep = new WeakSet();
+  const units = classifyMessageRenderUnits(messages, _processStepTypes);
+  units.forEach((unit, index) => {
+    if (!unit.group) return;
+    _messageProcessGroups.set(messages[index], unit.group);
+    if (unit.isStep) _messageIsProcessStep.add(messages[index]);
+  });
+  return units.map((unit) => unit.key);
+}
 
 // dom references
 let _chatHistory = null;
 
 // state vars
 let _massRender = false;
+let _windowedRender = false;
 let _scrollOnNextProcessGroup = null;
+const _messageWindow = new MessageWindow({
+  getUnitKeys: getMessageRenderUnitKeys,
+});
+let _messageWindowRenderPromise = null;
+let _messageRenderQueue = Promise.resolve();
+let _messageRenderGeneration = 0;
+let _messageWindowHistory = null;
+let _messageWindowScrollFrame = null;
+let _lastMessageWindowScrollTop = 0;
+let _messageWindowFollowTail = true;
+let _messageWindowLoadingDirection = null;
+let _messageWindowSuppressScrollEvents = false;
+let _messageWindowPointerActive = false;
+let _messageWindowUserScrollUntil = 0;
+let _messageWindowResizeObserver = null;
+
+// Leave a small tolerance for fractional scroll positions and the passive
+// boundary indicator, but do not swap pages while the user is still reading.
+const MESSAGE_WINDOW_BOUNDARY_TOLERANCE_PX = 48;
+const MESSAGE_WINDOW_TAIL_TOLERANCE_PX = 80;
+const MESSAGE_WINDOW_USER_SCROLL_GRACE_MS = 1200;
+const LAZY_MESSAGE_PREVIEW_CHARS = 6000;
+const DEFERRED_REPLAY_ENTRY_THRESHOLD = 30;
+const DEFERRED_REPLAY_TEXT_THRESHOLD = 50000;
+
+/**
+ * @typedef {object} MessageHandlerArgs
+ * @property {number} [no]
+ * @property {string | number} id
+ * @property {string} type
+ * @property {string | undefined} [heading]
+ * @property {string | undefined} [content]
+ * @property {object | undefined} [kvps]
+ * @property {number | undefined} [timestamp]
+ * @property {number} [agentno]
+ */
+
+/**
+ * @typedef {{ element: Element } & Record<string, any>} MessageHandlerResult
+ */
+
+/**
+ * @typedef {object} SetMessageResult
+ * @property {IArguments} args
+ * @property {MessageHandlerResult} result
+ */
+
+/**
+ * @typedef {(args: MessageHandlerArgs & Record<string, any>) => (MessageHandlerResult|Promise<MessageHandlerResult>)} MessageHandler
+ */
+
+/**
+ * @typedef {object} ProcessStepArgs
+ * @property {string | number} id
+ * @property {string} title
+ * @property {string} code
+ * @property {string[] | undefined} [classes]
+ * @property {any} [kvps]
+ * @property {string | undefined} [content]
+ * @property {string[] | undefined} [contentClasses]
+ * @property {Element[] | undefined} [actionButtons]
+ * @property {any} log
+ * @property {boolean} [allowCompletedGroup]
+ */
+
 
 export function scrollOnNextProcessGroup() {
   _scrollOnNextProcessGroup = "wait";
 }
 
 // handlers for log message rendering
-export function getMessageHandler(type) {
+/**
+ * Returns a message renderer for a given log message type.
+ *
+ * The returned handler has the same input object shape as `setMessage(...)` passes through
+ * and may return a rich object `{ element, actionButtons?, ...additional }`.
+ *
+ * @param {string} type
+ * @returns {Promise<MessageHandler>}
+ */
+export async function getMessageHandler(type) {
   switch (type) {
     case "user":
       return drawMessageUser;
@@ -43,10 +155,6 @@ export function getMessageHandler(type) {
       return drawMessageResponse;
     case "tool":
       return drawMessageTool;
-    case "code_exe":
-      return drawMessageCodeExe;
-    case "browser":
-      return drawMessageBrowser;
     case "progress":
       return drawMessageProgress;
     case "mcp":
@@ -65,54 +173,357 @@ export function getMessageHandler(type) {
       return drawMessageUtil;
     case "hint":
       return drawMessageHint;
+    case "model_setup_gate":
+      return drawMessageModelSetupGate;
     default:
-      return drawMessageDefault;
+      return await getHandlerFromExtensions(type);
+  }
+
+  async function getHandlerFromExtensions(type){
+    const extData = { type: type, handler: undefined }
+    await callJsExtensions("get_message_handler", extData);
+    // return handler from extensions
+    if(typeof extData.handler == "function") return extData.handler;
+    //not set by extensions, return default
+    return drawMessageTool;
   }
 }
+
 
 // entrypoint called from poll/WS communication, this is how all messages are rendered and updated
 // input is raw log format
 export function setMessages(messages) {
-  // set _massRender flag for handlers to know how to behave
+  const generation = _messageRenderGeneration;
+  const task = _messageRenderQueue.then(
+    () => setMessagesNow(messages, generation),
+    () => setMessagesNow(messages, generation),
+  );
+  _messageRenderQueue = task.catch(() => undefined);
+  return task;
+}
+
+async function setMessagesNow(messages, generation) {
+  if (generation !== _messageRenderGeneration) return null;
+  messages = normalizeMessages(messages);
+  const context = { processStepTypes: new Set(PROCESS_STEP_TYPES) };
+  await callJsExtensions("get_process_step_types", context);
+  const types = _messageWindow.messageTypes;
+  for (const message of messages) types.add(String(message.type || ""));
+  for (const type of types) {
+    if (!context.processStepTypes.has(type) && await getMessageHandler(type) === drawMessageTool) {
+      context.processStepTypes.add(type);
+    }
+  }
+  if (generation !== _messageRenderGeneration) return null;
+  _processStepTypes = context.processStepTypes;
   const history = getChatHistoryEl();
-  const historyEmpty = !history || history.childElementCount === 0;
-  const isLargeAppend = !historyEmpty && messages.length > 10;
-  const cutoff = isLargeAppend ? Math.max(0, messages.length - 2) : 0;
-  const massRender = historyEmpty || isLargeAppend;
+  const followTail = shouldFollowMessageTail();
 
-  const mainScroller = new Scroller(history, {
-    smooth: !massRender,
-    toleranceRem: 4,
-    reapplyDelayMs: 1000,
-    applyStabilization: true,
-  });
+  const addedMessageKeys = _messageWindow.merge(messages, { followTail });
+  bindMessageWindow(history);
+  if (_messageWindowRenderPromise) await _messageWindowRenderPromise;
 
-  const results = [];
-
-  // process messages
-  for (let i = 0; i < messages.length; i++) {
-    _massRender = historyEmpty || (isLargeAppend && i < cutoff);
-    results.push(setMessage(messages[i]) || {});
+  const initialWindow =
+    _messageWindow.size > 0 && !history?.querySelector(".message-group");
+  if (initialWindow && _messageWindowFollowTail) _messageWindow.showTail();
+  const compactedTail = _messageWindow.compactTailIfNeeded();
+  const windowMessages = _messageWindow.visibleMessages();
+  const cappedProcessGroupUpdate = hasCappedProcessGroupUpdate(
+    messages,
+    windowMessages,
+    addedMessageKeys,
+  );
+  if (initialWindow || compactedTail || cappedProcessGroupUpdate) {
+    return await renderMessageWindow({
+      preserveScroll: !initialWindow && !followTail,
+      generation,
+    });
   }
 
-  // reset _massRender flag
+  return await renderMessageBatch(messages, {
+    virtualizeOffscreen: true,
+    windowedRender: false,
+    generation,
+  });
+}
+
+export function resetMessageRenderState({ clearDom = true } = {}) {
+  _messageRenderGeneration += 1;
+  _messageWindow.reset([]);
   _massRender = false;
+  _windowedRender = false;
+  _scrollOnNextProcessGroup = null;
+  _messageWindowFollowTail = true;
+  _messageWindowLoadingDirection = null;
+  _messageWindowSuppressScrollEvents = false;
+  _messageWindowPointerActive = false;
+  _messageWindowUserScrollUntil = 0;
+  _messageWindowResizeObserver?.disconnect();
+  _messageWindowResizeObserver = null;
+  _processGroupStepLimits.clear();
+  _renderedProcessGroupPages.clear();
 
-  const shouldScroll = historyEmpty || !results[results.length - 1]?.dontScroll;
+  const history = document.getElementById("chat-history") || getChatHistoryEl();
+  if (history) cancelPendingScroll(history);
+  if (clearDom && history) history.replaceChildren();
+  if (history) {
+    delete history.dataset.messageWindowStart;
+    delete history.dataset.messageWindowEnd;
+    delete history.dataset.messageWindowTotal;
+  }
+}
 
-  if (shouldScroll) mainScroller.reApplyScroll();
+function normalizeMessages(messages) {
+  const normalized = Array.isArray(messages) ? [...messages].filter(Boolean) : [];
+  normalized.sort(
+    (a, b) =>
+      (a.no ?? Number.MAX_SAFE_INTEGER) -
+      (b.no ?? Number.MAX_SAFE_INTEGER),
+  );
+  return normalized;
+}
+
+async function renderMessageWindow({
+  preserveScroll = true,
+  generation = _messageRenderGeneration,
+} = {}) {
+  if (_messageWindowRenderPromise) return await _messageWindowRenderPromise;
+
+  _messageWindowRenderPromise = (async () => {
+    const history = getChatHistoryEl();
+    if (!history) return null;
+    const stagingHistory = createMessageWindowStagingHistory(history);
+
+    _messageWindowSuppressScrollEvents = true;
+    cancelPendingScroll(history);
+    _messageWindowResizeObserver?.disconnect();
+    try {
+      const anchor = preserveScroll
+        ? captureMessageWindowAnchor(history)
+        : null;
+      const expansionState = captureMessageExpansionState(history);
+      _chatHistory = stagingHistory;
+
+      const windowMessages = _messageWindow.visibleMessages();
+      const renderMessages = getProcessGroupRenderMessages(windowMessages);
+      const context = await renderMessageBatch(renderMessages, {
+        forceHistoryEmpty: true,
+        forceMassRender: true,
+        suppressScroll: preserveScroll,
+        windowedRender: shouldDeferReplayDetails(renderMessages),
+        windowRebuild: true,
+        generation,
+      });
+
+      if (generation !== _messageRenderGeneration) {
+        return null;
+      }
+
+      updateProcessGroupPagingControls(stagingHistory);
+      await restoreMessageExpansionState(stagingHistory, expansionState);
+      await nextAnimationFrame();
+
+      if (generation !== _messageRenderGeneration) return null;
+
+      _messageWindowResizeObserver?.disconnect();
+      stagingHistory
+        .querySelectorAll(".message-container")
+        .forEach((element) => element.classList.add("message-window-restored"));
+      const stagedChildren = Array.from(stagingHistory.childNodes);
+      const stagedWindowState = {
+        messageWindowStart: stagingHistory.dataset.messageWindowStart,
+        messageWindowEnd: stagingHistory.dataset.messageWindowEnd,
+        messageWindowTotal: stagingHistory.dataset.messageWindowTotal,
+        detailMode: stagingHistory.dataset.detailMode,
+      };
+      stagingHistory.remove();
+      _chatHistory = history;
+
+      history.replaceChildren(...stagedChildren);
+      copyMessageWindowDataset(history, stagedWindowState);
+      let anchorRestored = anchor
+        ? restoreMessageWindowAnchor(history, anchor)
+        : false;
+      if (!anchorRestored && _messageWindow.isAtTail() && _messageWindowFollowTail) {
+        history.scrollTop = history.scrollHeight;
+      }
+
+      await nextAnimationFrame();
+      refreshCollapsibleMessageOverflow(history);
+      if (anchor) {
+        anchorRestored = restoreMessageWindowAnchor(history, anchor) ||
+          anchorRestored;
+      }
+      if (!anchorRestored && _messageWindow.isAtTail() && _messageWindowFollowTail) {
+        history.scrollTop = history.scrollHeight;
+      }
+
+      context.history = history;
+      context.mainScroller = null;
+      refreshMessageWindowResizeObserver(history);
+      return context;
+    } finally {
+      stagingHistory.remove();
+      _chatHistory = history;
+      _lastMessageWindowScrollTop = history.scrollTop;
+      _messageWindowSuppressScrollEvents = false;
+    }
+  })();
+
+  try {
+    return await _messageWindowRenderPromise;
+  } finally {
+    _messageWindowRenderPromise = null;
+  }
+}
+
+function shouldDeferReplayDetails(messages) {
+  if (
+    _messageWindow.hasOlder ||
+    _messageWindow.hasNewer ||
+    messages.length > DEFERRED_REPLAY_ENTRY_THRESHOLD
+  ) {
+    return true;
+  }
+
+  let textSize = 0;
+  for (const message of messages) {
+    textSize += String(message?.heading ?? "").length;
+    textSize += String(message?.content ?? "").length;
+    for (const value of Object.values(message?.kvps || {})) {
+      textSize += typeof value === "string" ? value.length : 500;
+    }
+    if (textSize > DEFERRED_REPLAY_TEXT_THRESHOLD) return true;
+  }
+  return false;
+}
+
+async function renderMessageBatch(messages, options = {}) {
+  const generation = options.generation ?? _messageRenderGeneration;
+  if (generation !== _messageRenderGeneration) return null;
+  const history = getChatHistoryEl();
+  const context = {
+    messages: normalizeMessages(messages),
+    history,
+    historyEmpty:
+      options.forceHistoryEmpty ?? !history?.querySelector(".message-group"),
+    isLargeAppend: false,
+    cutoff: 0,
+    massRender: false,
+    windowRebuild: Boolean(options.windowRebuild),
+    messageWindow: getMessageWindowContext(),
+    scrollerOptions: {
+      smooth: true,
+      toleranceRem: 4,
+      reapplyDelayMs: 1000,
+      applyStabilization: true,
+    },
+    /** @type {Scroller | null} */
+    mainScroller: null,
+    /** @type {SetMessageResult[]} */
+    results: [],
+  };
+
+  context.isLargeAppend = !context.historyEmpty && context.messages.length > 10;
+  context.cutoff = context.isLargeAppend
+    ? Math.max(0, context.messages.length - 2)
+    : 0;
+  context.massRender =
+    Boolean(options.forceMassRender) ||
+    context.historyEmpty ||
+    context.isLargeAppend;
+  context.scrollerOptions.smooth = !context.massRender;
+
+  await callJsExtensions("set_messages_before_loop", context);
+  if (generation !== _messageRenderGeneration) {
+    context.history?.replaceChildren();
+    return null;
+  }
+
+  if (context.history) {
+    context.mainScroller = new Scroller(
+      context.history,
+      context.scrollerOptions,
+    );
+  }
+
+  try {
+    for (let i = 0; i < context.messages.length; i++) {
+      if (generation !== _messageRenderGeneration) break;
+      const message = context.messages[i];
+      const messageKey = getMessageCacheKey(message);
+      if (
+        options.virtualizeOffscreen &&
+        messageKey &&
+        !_messageWindow.isKeyVisible(messageKey)
+      ) {
+        context.results.push({
+          args: message,
+          result: { element: null, virtualized: true, dontScroll: true },
+        });
+        continue;
+      }
+      _massRender =
+        Boolean(options.forceMassRender) ||
+        context.historyEmpty ||
+        (context.isLargeAppend && i < context.cutoff);
+      _windowedRender = Boolean(options.windowedRender);
+      const entry = await setMessage(message);
+      if (generation !== _messageRenderGeneration) {
+        context.history?.replaceChildren();
+        break;
+      }
+      context.results.push(entry);
+    }
+
+    if (generation === _messageRenderGeneration) {
+      updateMessageWindowIndicators(context.history);
+      if (
+        context.windowRebuild &&
+        typeof preferencesStore.applyCurrentDetailMode === "function"
+      ) {
+        await preferencesStore.applyCurrentDetailMode(context.history);
+      }
+      refreshMessageWindowResizeObserver(context.history);
+      await callJsExtensions("set_messages_after_loop", context);
+    }
+  } finally {
+    _massRender = false;
+    _windowedRender = false;
+  }
+
+  if (generation !== _messageRenderGeneration) return null;
+
+  const lastResult = context.results[context.results.length - 1]?.result;
+  const shouldScroll =
+    !options.suppressScroll &&
+    (context.historyEmpty || !lastResult?.dontScroll);
+
+  if (shouldScroll) context.mainScroller?.reApplyScroll();
 
   if (_scrollOnNextProcessGroup === "scroll") {
     requestAnimationFrame(() => {
-      mainScroller.scrollToBottom();
+      if (
+        generation !== _messageRenderGeneration ||
+        _scrollOnNextProcessGroup !== "scroll"
+      ) {
+        return;
+      }
+      context.mainScroller?.scrollToBottom();
       _scrollOnNextProcessGroup = null;
     });
   }
+
+  return context;
 }
 
 // entrypoint called from poll/WS communication, this is how all messages are rendered and updated
 // input is raw log format
-export function setMessage({
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {Promise<SetMessageResult>}
+ */
+export async function setMessage({
   no,
   id,
   type,
@@ -123,10 +534,12 @@ export function setMessage({
   agentno,
   ...additional
 }) {
-  const handler = getMessageHandler(type);
+  const rawMessage = arguments[0];
+  const handler = await getMessageHandler(type);
   // prefer log ID if set to match user message created on frontend with backend updates
-  return handler({
-    id: id || no,
+  const handlerArgs = {
+    no,
+    id: id || String(no) || "",
     type,
     heading,
     content,
@@ -134,7 +547,33 @@ export function setMessage({
     timestamp,
     agentno,
     ...additional,
-  });
+  };
+  handlerArgs[PROCESS_GROUP_RENDER_INFO] = _messageProcessGroups.get(rawMessage);
+  const handlerResult = await handler(handlerArgs);
+  const messageKey = getMessageCacheKey(rawMessage);
+
+  if (handlerResult?.element && messageKey) {
+    handlerResult.element.dataset.messageKey = messageKey;
+  }
+  if (handlerResult?.element && no !== undefined && no !== null) {
+    handlerResult.element.dataset.logNo = String(no);
+  }
+
+  if (handlerResult?.step) {
+    handlerResult.step.__renderDetail = async () => {
+      if (!handlerResult.step?.isConnected) return null;
+      return await requestDeferredMessageDetail(rawMessage);
+    };
+    handlerResult.step.__discardDetail = () =>
+      discardProcessStepDetail(handlerResult.step);
+    handlerResult.step.__setExpanded = (expanded) =>
+      toggleStepCollapse(handlerResult.step, expanded);
+  }
+
+  return {
+    args: rawMessage,
+    result: handlerResult,
+  }
 }
 
 function getOrCreateMessageContainer(
@@ -143,7 +582,7 @@ function getOrCreateMessageContainer(
   containerClasses = [],
   forceNewGroup = false,
 ) {
-  let container = document.getElementById(`message-${id}`);
+  let container = getChatHistoryElementById(`message-${id}`);
   if (!container) {
     container = document.createElement("div");
     container.id = `message-${id}`;
@@ -166,8 +605,621 @@ function getChatHistoryEl() {
   return _chatHistory;
 }
 
+function getChatHistoryElementById(id) {
+  const history = getChatHistoryEl();
+  if (!history || !id) return null;
+  if (globalThis.CSS?.escape) {
+    return history.querySelector(`#${globalThis.CSS.escape(id)}`);
+  }
+  return Array.from(history.querySelectorAll("[id]")).find(
+    (element) => element.id === id,
+  ) || null;
+}
+
 function getLastMessageGroup() {
-  return getChatHistoryEl()?.lastElementChild;
+  const groups = getChatHistoryEl()?.querySelectorAll(":scope > .message-group");
+  return groups?.[groups.length - 1] || null;
+}
+
+function getMessageWindowContext() {
+  return {
+    start: _messageWindow.visibleStart,
+    end: _messageWindow.visibleEnd,
+    total: _messageWindow.size,
+    rendered: _messageWindow.renderedCount,
+    older: _messageWindow.olderCount,
+    newer: _messageWindow.newerCount,
+    hasOlder: _messageWindow.hasOlder,
+    hasNewer: _messageWindow.hasNewer,
+  };
+}
+
+function getProcessGroupPageState(messages) {
+  const groups = new Map();
+  for (const message of messages) {
+    const group = _messageProcessGroups.get(message);
+    if (!group || !_messageIsProcessStep.has(message)) continue;
+    let state = groups.get(group.key);
+    if (!state) {
+      state = { group, steps: [] };
+      groups.set(group.key, state);
+    }
+    state.steps.push(message);
+  }
+  return groups;
+}
+
+function getProcessGroupRenderMessages(messages) {
+  const groups = getProcessGroupPageState(messages);
+  const hiddenByGroup = new Map();
+  _renderedProcessGroupPages = new Map();
+
+  for (const [key, state] of groups) {
+    const limit = _processGroupStepLimits.get(key) ||
+      PROCESS_GROUP_STEP_PAGE_SIZE;
+    const hidden = Math.max(0, state.steps.length - limit);
+    hiddenByGroup.set(key, hidden);
+    _renderedProcessGroupPages.set(key, {
+      ...state,
+      hidden,
+      visible: state.steps.length - hidden,
+    });
+  }
+
+  const seen = new Map();
+  return messages.filter((message) => {
+    const group = _messageProcessGroups.get(message);
+    if (!group || !_messageIsProcessStep.has(message)) return true;
+    const index = seen.get(group.key) || 0;
+    seen.set(group.key, index + 1);
+    return index >= (hiddenByGroup.get(group.key) || 0);
+  });
+}
+
+function hasCappedProcessGroupUpdate(messages, windowMessages, addedMessageKeys) {
+  if (!messages.length) return false;
+  const groupStates = getProcessGroupPageState(windowMessages);
+  return messages.some((message) => {
+    const group = _messageProcessGroups.get(message);
+    if (!group || !_messageIsProcessStep.has(message)) return false;
+    const total = groupStates.get(group.key)?.steps.length || 0;
+    const limit = _processGroupStepLimits.get(group.key) ||
+      PROCESS_GROUP_STEP_PAGE_SIZE;
+    return total > limit && addedMessageKeys.has(getMessageCacheKey(message));
+  });
+}
+
+function updateProcessGroupPagingControls(history) {
+  history
+    ?.querySelectorAll(".process-group-show-more")
+    .forEach((element) => element.remove());
+
+  for (const [key, state] of _renderedProcessGroupPages) {
+    const group = Array.from(
+      history?.querySelectorAll(".process-group[data-render-group-key]") || [],
+    ).find((candidate) => candidate.dataset.renderGroupKey === key);
+    if (!group) continue;
+
+    const allSteps = state.steps;
+    const firstTimestamp = allSteps[0]?.timestamp;
+    const lastTimestamp = allSteps.at(-1)?.timestamp;
+    if (firstTimestamp != null) {
+      group.dataset.fullStartTimestamp = String(firstTimestamp);
+      group.setAttribute("data-start-timestamp", String(firstTimestamp));
+    }
+    if (lastTimestamp != null) {
+      group.dataset.fullEndTimestamp = String(lastTimestamp);
+    }
+    group.dataset.fullAgentSteps = String(
+      Math.max(
+        0,
+        allSteps.filter((message) => message?.type === "agent").length - 1,
+      ),
+    );
+    group.dataset.fullWarningSteps = String(
+      allSteps.filter((message) => message?.type === "warning").length,
+    );
+    group.dataset.fullInfoSteps = String(
+      allSteps.filter((message) => message?.type === "info").length,
+    );
+    const lastAgentMessage = allSteps.findLast(
+      (message) => message?.type === "agent",
+    );
+    const fullTitle = cleanStepTitle(lastAgentMessage?.heading, 50);
+    if (fullTitle) {
+      const title = group.querySelector(".process-group-header .group-title");
+      if (title) title.textContent = fullTitle;
+    }
+    updateProcessGroupHeader(group);
+
+    if (state.hidden <= 0) continue;
+    const stepsContainer = group.querySelector(":scope .process-steps");
+    if (!stepsContainer) continue;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "process-group-show-more";
+    button.textContent = "Show more";
+    const nextCount = Math.min(PROCESS_GROUP_STEP_PAGE_SIZE, state.hidden);
+    button.setAttribute("aria-label", `Show ${nextCount} earlier steps`);
+    button.addEventListener("click", () => {
+      void showMoreProcessGroupSteps(key);
+    });
+    stepsContainer.insertBefore(button, stepsContainer.firstChild);
+  }
+}
+
+function showMoreProcessGroupSteps(groupKey) {
+  const generation = _messageRenderGeneration;
+  const task = _messageRenderQueue.then(async () => {
+    if (generation !== _messageRenderGeneration) return false;
+    const current = _processGroupStepLimits.get(groupKey) ||
+      PROCESS_GROUP_STEP_PAGE_SIZE;
+    _processGroupStepLimits.set(
+      groupKey,
+      current + PROCESS_GROUP_STEP_PAGE_SIZE,
+    );
+    await renderMessageWindow({ preserveScroll: true, generation });
+    return true;
+  });
+  _messageRenderQueue = task.catch(() => undefined);
+  return task;
+}
+
+function shouldFollowMessageTail() {
+  if (_messageWindow.size === 0) return true;
+  return _messageWindowFollowTail && _messageWindow.isAtTail();
+}
+
+async function renderDeferredMessageDetail(message) {
+  const entry = await setMessage(message);
+  await callJsExtensions("set_messages_after_loop", {
+    messages: [message],
+    history: getChatHistoryEl(),
+    historyEmpty: true,
+    isLargeAppend: false,
+    cutoff: 0,
+    massRender: false,
+    windowRebuild: false,
+    detailMaterialization: true,
+    messageWindow: getMessageWindowContext(),
+    mainScroller: null,
+    results: [entry],
+  });
+  return entry;
+}
+
+function requestDeferredMessageDetail(message) {
+  if (_messageWindowRenderPromise) {
+    return renderDeferredMessageDetail(message);
+  }
+
+  const generation = _messageRenderGeneration;
+  const task = _messageRenderQueue.then(async () => {
+    if (generation !== _messageRenderGeneration) return null;
+    return await renderDeferredMessageDetail(message);
+  });
+  _messageRenderQueue = task.catch(() => undefined);
+  return task;
+}
+
+function bindMessageWindow(history) {
+  if (!history || _messageWindowHistory === history) return;
+  _messageWindowHistory = history;
+  _lastMessageWindowScrollTop = history.scrollTop;
+
+  const noteUserScrollIntent = () => {
+    _messageWindowUserScrollUntil =
+      messageWindowNow() + MESSAGE_WINDOW_USER_SCROLL_GRACE_MS;
+  };
+
+  history.addEventListener("wheel", noteUserScrollIntent, { passive: true });
+  history.addEventListener("touchstart", noteUserScrollIntent, {
+    passive: true,
+  });
+  history.addEventListener("pointerdown", () => {
+    _messageWindowPointerActive = true;
+    noteUserScrollIntent();
+  });
+  globalThis.addEventListener("pointerup", () => {
+    _messageWindowPointerActive = false;
+  });
+  globalThis.addEventListener("pointercancel", () => {
+    _messageWindowPointerActive = false;
+  });
+  globalThis.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (
+      target instanceof Element &&
+      target.closest("input, textarea, select, [contenteditable='true']")
+    ) {
+      return;
+    }
+    if (
+      ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(
+        event.key,
+      )
+    ) {
+      noteUserScrollIntent();
+    }
+  });
+
+  history.addEventListener(
+    "scroll",
+    () => {
+      if (_messageWindowScrollFrame != null) return;
+      _messageWindowScrollFrame = requestAnimationFrame(() => {
+        _messageWindowScrollFrame = null;
+        if (_messageWindowRenderPromise) return;
+
+        const previous = _lastMessageWindowScrollTop;
+        const current = history.scrollTop;
+        const direction = current < previous ? "older" : current > previous ? "newer" : null;
+        _lastMessageWindowScrollTop = current;
+
+        const hasUserScrollIntent =
+          _messageWindowPointerActive ||
+          messageWindowNow() <= _messageWindowUserScrollUntil;
+        const bottomDistance =
+          history.scrollHeight - current - history.clientHeight;
+
+        if (hasUserScrollIntent && direction) {
+          _messageWindowFollowTail =
+            _messageWindow.isAtTail() &&
+            bottomDistance <= MESSAGE_WINDOW_TAIL_TOLERANCE_PX;
+        }
+
+        if (
+          _messageWindowSuppressScrollEvents ||
+          _messageWindowRenderPromise ||
+          !hasUserScrollIntent
+        ) {
+          return;
+        }
+
+        if (
+          direction === "older" &&
+          current <= MESSAGE_WINDOW_BOUNDARY_TOLERANCE_PX &&
+          _messageWindow.hasOlder
+        ) {
+          void shiftMessageWindow("older");
+          return;
+        }
+
+        if (
+          direction === "newer" &&
+          bottomDistance <= MESSAGE_WINDOW_BOUNDARY_TOLERANCE_PX &&
+          _messageWindow.hasNewer
+        ) {
+          void shiftMessageWindow("newer");
+        }
+      });
+    },
+    { passive: true },
+  );
+}
+
+function messageWindowNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function refreshMessageWindowResizeObserver(history) {
+  if (!history || typeof ResizeObserver === "undefined") return;
+  if (!_messageWindowResizeObserver) {
+    _messageWindowResizeObserver = new ResizeObserver((entries) => {
+      entries.forEach((entry) =>
+        refreshCollapsibleMessageOverflow(entry.target),
+      );
+
+      const liveHistory = getChatHistoryEl();
+      if (
+        _messageWindowSuppressScrollEvents ||
+        _messageWindowRenderPromise ||
+        !_messageWindowFollowTail ||
+        !_messageWindow.isAtTail()
+      ) {
+        return;
+      }
+
+      cancelPendingScroll(liveHistory);
+      liveHistory.scrollTop = liveHistory.scrollHeight;
+      _lastMessageWindowScrollTop = liveHistory.scrollTop;
+    });
+  }
+
+  history
+    .querySelectorAll(":scope > .message-group")
+    .forEach((group) => _messageWindowResizeObserver.observe(group));
+}
+
+async function shiftMessageWindow(direction) {
+  await loadAdjacentMessageWindow(direction);
+}
+
+export function loadAdjacentMessageWindow(direction) {
+  if (!["older", "newer"].includes(direction)) {
+    return Promise.resolve(false);
+  }
+  if (_messageWindowLoadingDirection) return Promise.resolve(false);
+
+  const generation = _messageRenderGeneration;
+  _messageWindowLoadingDirection = direction;
+  setMessageWindowIndicatorLoading(getChatHistoryEl(), direction, true);
+
+  const renderTask = _messageRenderQueue.then(async () => {
+    if (generation !== _messageRenderGeneration) return false;
+    const shifted =
+      direction === "older"
+        ? _messageWindow.shiftOlder()
+        : _messageWindow.shiftNewer();
+    if (!shifted) return false;
+    await renderMessageWindow({ preserveScroll: true, generation });
+    return true;
+  });
+  const task = renderTask.finally(() => {
+    if (_messageWindowLoadingDirection === direction) {
+      _messageWindowLoadingDirection = null;
+      setMessageWindowIndicatorLoading(getChatHistoryEl(), direction, false);
+    }
+  });
+  _messageRenderQueue = task.catch(() => undefined);
+  return task;
+}
+
+export function scrollMessageWindowToEdge(edge) {
+  const generation = _messageRenderGeneration;
+  const task = _messageRenderQueue.then(async () => {
+    if (generation !== _messageRenderGeneration) return false;
+    const history = getChatHistoryEl();
+
+    if (edge === "start") {
+      _messageWindowFollowTail = false;
+      cancelPendingScroll(history);
+      if (!_messageWindow.hasOlder && _messageWindow.start === 0) {
+        history?.scrollTo({ top: 0, behavior: "instant" });
+        return true;
+      }
+      _messageWindow.showHead();
+      await renderMessageWindow({ preserveScroll: false, generation });
+      history?.scrollTo({ top: 0, behavior: "instant" });
+      return true;
+    }
+
+    _messageWindowFollowTail = true;
+    cancelPendingScroll(history);
+    if (_messageWindow.isAtTail()) {
+      if (history) history.scrollTop = history.scrollHeight;
+      return true;
+    }
+    _messageWindow.showTail();
+    await renderMessageWindow({ preserveScroll: false, generation });
+    if (history) history.scrollTop = history.scrollHeight;
+    return true;
+  });
+  _messageRenderQueue = task.catch(() => undefined);
+  return task;
+}
+
+export function getMessageWindowState() {
+  return getMessageWindowContext();
+}
+
+function updateMessageWindowIndicators(history) {
+  if (!history) return;
+  history
+    .querySelectorAll(":scope > [data-message-window-ui]")
+    .forEach((element) => element.remove());
+
+  history.dataset.messageWindowStart = String(_messageWindow.visibleStart);
+  history.dataset.messageWindowEnd = String(_messageWindow.visibleEnd);
+  history.dataset.messageWindowTotal = String(_messageWindow.size);
+
+  if (_messageWindow.hasOlder) {
+    const older = createMessageWindowIndicator("older");
+    history.insertBefore(older, history.firstChild);
+  }
+
+  if (_messageWindow.hasNewer) {
+    history.appendChild(createMessageWindowIndicator("newer"));
+  }
+}
+
+function setMessageWindowIndicatorLoading(history, direction, loading) {
+  if (!history) return;
+  let indicator = history.querySelector(
+    `:scope > [data-message-window-ui="${direction}"]`,
+  );
+  if (!indicator && loading) {
+    updateMessageWindowIndicators(history);
+    indicator = history.querySelector(
+      `:scope > [data-message-window-ui="${direction}"]`,
+    );
+  }
+  if (!indicator) return;
+
+  indicator.classList.toggle("is-loading", loading);
+  indicator
+    .querySelector(":scope > .three-bubble-loader")
+    ?.classList.toggle("is-active", loading);
+  if (loading) {
+    const label = direction === "older" ? "earlier" : "newer";
+    indicator.setAttribute("role", "status");
+    indicator.setAttribute("aria-live", "polite");
+    indicator.setAttribute("aria-label", `Loading ${label} messages`);
+    indicator.removeAttribute("aria-hidden");
+  } else {
+    indicator.removeAttribute("role");
+    indicator.removeAttribute("aria-live");
+    indicator.removeAttribute("aria-label");
+    indicator.setAttribute("aria-hidden", "true");
+  }
+}
+
+function createMessageWindowIndicator(direction) {
+  const indicator = document.createElement("div");
+  const label = direction === "older" ? "earlier" : "newer";
+  const isLoading = _messageWindowLoadingDirection === direction;
+  indicator.className = `message-window-loader message-window-${direction}`;
+  indicator.classList.toggle("is-loading", isLoading);
+  indicator.dataset.messageWindowUi = direction;
+  if (isLoading) {
+    indicator.setAttribute("role", "status");
+    indicator.setAttribute("aria-live", "polite");
+    indicator.setAttribute("aria-label", `Loading ${label} messages`);
+  } else {
+    indicator.setAttribute("aria-hidden", "true");
+  }
+  indicator.appendChild(createThreeBubbleLoader({ active: isLoading }));
+  const statusLabel = document.createElement("span");
+  statusLabel.className = "loading-indicator-label";
+  statusLabel.textContent = `Loading ${label} messages`;
+  indicator.appendChild(statusLabel);
+  return indicator;
+}
+
+function createMessageWindowStagingHistory(history) {
+  const staging = history.cloneNode(false);
+  const historyRect = history.getBoundingClientRect();
+  staging.classList.add("message-window-staging");
+  staging.setAttribute("aria-hidden", "true");
+  staging.style.position = "fixed";
+  staging.style.top = "0";
+  staging.style.left = "-100000px";
+  staging.style.width = `${historyRect.width}px`;
+  staging.style.height = `${historyRect.height}px`;
+  staging.style.visibility = "hidden";
+  staging.style.pointerEvents = "none";
+  staging.style.contain = "layout style paint";
+  delete staging.dataset.scrollerTimeout;
+  delete staging.dataset.scrollerReapplySnapshot;
+  delete staging.dataset.scrollingTo;
+  history.after(staging);
+  return staging;
+}
+
+function copyMessageWindowDataset(history, state) {
+  for (const [key, value] of Object.entries(state)) {
+    if (value === undefined) delete history.dataset[key];
+    else history.dataset[key] = value;
+  }
+}
+
+function getMessageWindowAnchorCandidates(history) {
+  return Array.from(
+    history.querySelectorAll(
+      ".process-group[data-render-group-key], [data-message-key]",
+    ),
+  ).filter((element) =>
+    element.dataset.renderGroupKey || !element.closest(".process-group")
+  );
+}
+
+function getMessageWindowAnchorIdentity(element) {
+  if (element?.dataset?.renderGroupKey) {
+    return `group:${element.dataset.renderGroupKey}`;
+  }
+  if (element?.dataset?.messageKey) {
+    return `message:${element.dataset.messageKey}`;
+  }
+  return null;
+}
+
+function captureMessageWindowAnchor(history) {
+  const historyRect = history.getBoundingClientRect();
+  const candidates = getMessageWindowAnchorCandidates(history);
+  let fallback = null;
+
+  for (const element of candidates) {
+    const rect = element.getBoundingClientRect();
+    if (rect.height <= 0 || rect.bottom <= historyRect.top) continue;
+    const anchor = {
+      identity: getMessageWindowAnchorIdentity(element),
+      offset: rect.top - historyRect.top,
+    };
+    if (rect.top < historyRect.bottom) return anchor;
+    fallback ||= anchor;
+  }
+
+  return fallback;
+}
+
+function restoreMessageWindowAnchor(history, anchor) {
+  if (!anchor?.identity) return false;
+  const historyRect = history.getBoundingClientRect();
+  const element = getMessageWindowAnchorCandidates(history).find(
+    (candidate) =>
+      getMessageWindowAnchorIdentity(candidate) === anchor.identity,
+  );
+  if (!element) return false;
+  const nextOffset = element.getBoundingClientRect().top - historyRect.top;
+  history.scrollTop += nextOffset - anchor.offset;
+  return true;
+}
+
+function captureMessageExpansionState(history) {
+  const state = new Map();
+  history
+    .querySelectorAll(".process-group[id], .process-step[id]")
+    .forEach((element) => {
+      const kind = element.classList.contains("process-group")
+        ? "group"
+        : "step";
+      state.set(
+        `${kind}:${element.id}`,
+        element.classList.contains("expanded"),
+      );
+    });
+  history
+    .querySelectorAll("[data-message-key] > .message")
+    .forEach((element) => {
+      state.set(
+        `message:${element.parentElement.dataset.messageKey}`,
+        element.classList.contains("expanded"),
+      );
+    });
+  return state;
+}
+
+async function restoreMessageExpansionState(history, state) {
+  const pending = [];
+  for (const [key, expanded] of state) {
+    let element = null;
+    if (key.startsWith("group:") || key.startsWith("step:")) {
+      const separator = key.indexOf(":");
+      const kind = key.slice(0, separator);
+      const id = key.slice(separator + 1);
+      const selector = kind === "group" ? ".process-group[id]" : ".process-step[id]";
+      element = Array.from(history.querySelectorAll(selector)).find(
+        (candidate) => candidate.id === id,
+      );
+    } else if (key.startsWith("message:")) {
+      const messageKey = key.slice(8);
+      const container = Array.from(
+        history.querySelectorAll("[data-message-key]"),
+      ).find((candidate) => candidate.dataset.messageKey === messageKey);
+      element = container?.querySelector(":scope > .message") || null;
+    }
+    if (!element || !history.contains(element)) continue;
+    if (typeof element.__setExpanded === "function") {
+      pending.push(Promise.resolve(element.__setExpanded(expanded)));
+    } else {
+      element.classList.toggle("expanded", expanded);
+    }
+  }
+  await Promise.allSettled(pending);
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => {
+    // Browsers may stop painting hidden or occluded windows. A visual layout
+    // yield must not hold state synchronization until the window is repainted.
+    const finish = () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+      resolve();
+    };
+    const frame = requestAnimationFrame(finish);
+    const timer = setTimeout(finish, 100);
+  });
 }
 
 function appendToMessageGroup(
@@ -178,7 +1230,7 @@ function appendToMessageGroup(
   const chatHistoryEl = getChatHistoryEl();
   if (!chatHistoryEl) return;
 
-  const lastGroup = chatHistoryEl.lastElementChild;
+  const lastGroup = getLastMessageGroup();
   const lastGroupType = lastGroup?.getAttribute("data-group-type");
 
   if (!forceNewGroup && lastGroup && lastGroupType === position) {
@@ -188,24 +1240,27 @@ function appendToMessageGroup(
     group.classList.add("message-group", `message-group-${position}`);
     group.setAttribute("data-group-type", position);
     group.appendChild(messageContainer);
-    chatHistoryEl.appendChild(group);
+    const bottomControl = chatHistoryEl.querySelector(
+      ':scope > [data-message-window-ui="newer"]',
+    );
+    chatHistoryEl.insertBefore(group, bottomControl || null);
   }
 }
 
 function getLastProcessGroup(allowCompleted = true) {
   const lastContainer = getLastMessageGroup();
   if (!lastContainer) return null;
-  const groups = lastContainer.querySelectorAll(".process-group");
-  if (groups.length === 0) return null;
-  const group = groups[groups.length - 1];
+  const group = lastContainer.lastElementChild?.querySelector(":scope > .process-group");
+  if (!group) return null;
   if (!allowCompleted && isProcessGroupComplete(group)) return null;
 
   return group;
 }
 
-function getOrCreateProcessGroup(id, allowCompleted = true) {
+function getOrCreateProcessGroup(id, allowCompleted = true, renderInfo = null) {
+  const groupIdentity = renderInfo?.id || id;
   // first try direct match by ID
-  const byId = document.getElementById(`process-group-${id}`);
+  const byId = getChatHistoryElementById(`process-group-${groupIdentity}`);
   if (byId) return byId;
 
   // if not found, try to find the last process group
@@ -214,14 +1269,14 @@ function getOrCreateProcessGroup(id, allowCompleted = true) {
 
   // lastly create new
   const messageContainer = document.createElement("div");
-  messageContainer.id = `process-group-${id}`;
   messageContainer.classList.add(
     "message-container",
     "ai-container",
     "has-process-group",
   );
 
-  const group = createProcessGroup(id);
+  const group = createProcessGroup(groupIdentity);
+  if (renderInfo?.key) group.dataset.renderGroupKey = renderInfo.key;
   group.classList.add("embedded");
   messageContainer.appendChild(group);
 
@@ -233,7 +1288,7 @@ function getOrCreateProcessGroup(id, allowCompleted = true) {
   return group;
 }
 
-function buildDetailPayload(stepData, extras = {}) {
+export function buildDetailPayload(stepData, extras = {}) {
   if (!stepData) return null;
   return {
     ...stepData,
@@ -241,7 +1296,11 @@ function buildDetailPayload(stepData, extras = {}) {
   };
 }
 
-function drawProcessStep({
+/**
+ * @param {ProcessStepArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
+export function drawProcessStep({
   id,
   title,
   code,
@@ -256,11 +1315,26 @@ function drawProcessStep({
 }) {
   // group and steps DOM elements
   const stepId = `process-step-${id}`;
-  let step = document.getElementById(stepId);
+  let step = getChatHistoryElementById(stepId);
 
+  const renderInfo = log[PROCESS_GROUP_RENDER_INFO];
   const group =
     getStepProcessGroup(step) ||
-    getOrCreateProcessGroup(id, allowCompletedGroup);
+    getOrCreateProcessGroup(
+      id,
+      allowCompletedGroup,
+      renderInfo,
+    );
+  if (renderInfo) {
+    // A later process step can promote a previously standalone live utility
+    // into a substantive unit when the full cache is reclassified.
+    group.classList.remove("utility-only");
+  } else if (log.type === "util") {
+    // Standalone utilities are not part of a substantive render unit. Mark
+    // them directly from the full-log classifier instead of inferring group
+    // visibility from whichever child steps happen to be mounted so far.
+    group.classList.add("utility-only");
+  }
   const stepsContainer = group.querySelector(".process-steps");
 
   const isNewStep = !step;
@@ -275,7 +1349,7 @@ function drawProcessStep({
     group.setAttribute("data-start-timestamp", String(log.timestamp));
   }
 
-  if (isNewStep) {
+  if (!step) {
     // create the base DOM element for the step
     step = document.createElement("div");
     step.id = stepId;
@@ -283,7 +1357,7 @@ function drawProcessStep({
 
     // set data attributes of the step
     step.setAttribute("data-log-type", log.type);
-    step.setAttribute("data-step-id", id);
+    step.setAttribute("data-step-id", String(id));
     step.setAttribute("data-agent-number", log.agentno);
 
     // set timestamp attribute (convert to milliseconds for duration calculation)
@@ -357,6 +1431,8 @@ function drawProcessStep({
 
   // is step expanded?
   const isExpanded = step.classList.contains("expanded");
+  const shouldRenderDetail =
+    isExpanded && group.classList.contains("expanded");
 
   // create step header
   const stepHeader = ensureChild(
@@ -366,20 +1442,14 @@ function drawProcessStep({
     "process-step-header",
   );
 
-  // create step detail
+  // Keep the lightweight detail shell and action hooks mounted for extensions,
+  // but materialize text-heavy detail content only while the step is expanded.
   const stepDetail = ensureChild(
     step,
     ".process-step-detail",
     "div",
     "process-step-detail",
   );
-  const stepDetailScroll = ensureChild(
-    stepDetail,
-    ".process-step-detail-scroll",
-    "div",
-    "process-step-detail-scroll",
-  );
-
   // set click handlers
   setupProcessStepHandlers(step, stepHeader);
 
@@ -395,39 +1465,12 @@ function drawProcessStep({
     if (prevCode) step.classList.remove(prevCode);
     step.setAttribute("data-step-code", code);
     step.classList.add(code);
-    step.querySelector(".step-badge").textContent = code;
     badge.innerText = code;
   }
 
   // header row - title
   const titleEl = ensureChild(stepHeader, ".step-title", "span", "step-title");
   titleEl.textContent = title;
-
-  // auto-scroller of the step detail
-  const detailScroller = new Scroller(stepDetailScroll, {
-    smooth: !isMassRender(),
-    toleranceRem: 4,
-  }); // scroller for step detail content
-
-  // update KVPs of the step detail
-  const kvpsTable = drawKvpsIncremental(stepDetailScroll, kvps);
-
-  // update content
-  let stepDetailContent;
-  if(content){
-  stepDetailContent = ensureChild(
-    stepDetailScroll,
-    ".process-step-detail-content",
-    "p",
-    "process-step-detail-content",
-    ...(contentClasses || []),
-  );
-  const adjustedContent = adjustStepContent(content)
-  stepDetailContent.innerHTML = adjustedContent;
-  }
-
-  // reapply scroll position (autoscroll if bottom) - only when expanded already and not mass rendering
-  if (isExpanded) detailScroller.reApplyScroll();
 
   // Render action buttons: get/create container, clear, append
   const stepActionBtns = ensureChild(
@@ -437,17 +1480,31 @@ function drawProcessStep({
     "step-detail-actions",
     "step-action-buttons",
   );
-  stepActionBtns.textContent = "";
-  (actionButtons || [])
-    .filter(Boolean)
-    .forEach((button) => stepActionBtns.appendChild(button));
+  syncActionButtons(stepActionBtns, actionButtons);
+
+  let detailResult = {
+    content: undefined,
+    contentScroller: null,
+    kvpsTable: null,
+  };
+  if (shouldRenderDetail) {
+    detailResult = renderProcessStepDetail({
+      stepDetail,
+      kvps,
+      content,
+      contentClasses,
+      code,
+    });
+  } else {
+    discardProcessStepDetail(step);
+  }
 
   // update the process grop header by this step
   updateProcessGroupHeader(group);
 
   // remove shine from previous steps and add to this one if new and not completed
   if (isNewStep && !isGroupComplete) {
-    stepDetailScroll
+    group
       .querySelectorAll(".step-title.shiny-text")
       .forEach((el) => {
         el.classList.remove("shiny-text");
@@ -457,14 +1514,85 @@ function drawProcessStep({
 
   // return anything useful
   return {
+    element: step,
+    actionButtons,
     step,
     detail: stepDetail,
+    content: detailResult.content,
+    contentScroller: detailResult.contentScroller,
+    kvpsTable: detailResult.kvpsTable,
+    isExpanded,
+    detailPending: !shouldRenderDetail,
+  };
+}
+
+function renderProcessStepDetail({
+  stepDetail,
+  kvps,
+  content,
+  contentClasses,
+  code,
+}) {
+  let stepDetailScroll = stepDetail.querySelector(
+    ":scope > .process-step-detail-scroll",
+  );
+  if (!stepDetailScroll) {
+    stepDetailScroll = document.createElement("div");
+    stepDetailScroll.classList.add("process-step-detail-scroll");
+    stepDetail.insertBefore(
+      stepDetailScroll,
+      stepDetail.querySelector(":scope > .step-detail-actions"),
+    );
+  }
+
+  const detailScroller = new Scroller(stepDetailScroll, {
+    smooth: code !== "GEN" && !isMassRender(),
+    toleranceRem: 4,
+  });
+  const kvpsTable = drawKvpsIncremental(stepDetailScroll, kvps);
+
+  let stepDetailContent;
+  if (content) {
+    stepDetailContent = ensureChild(
+      stepDetailScroll,
+      ".process-step-detail-content",
+      "p",
+      "process-step-detail-content",
+      ...(contentClasses || []),
+    );
+    stepDetailContent.innerHTML = adjustStepContent(content);
+  } else {
+    stepDetailScroll
+      .querySelector(":scope > .process-step-detail-content")
+      ?.remove();
+  }
+
+  detailScroller.reApplyScroll();
+  return {
     content: stepDetailContent,
     contentScroller: detailScroller,
     kvpsTable,
-    actionButtons: stepActionBtns,
-    isExpanded,
   };
+}
+
+function discardProcessStepDetail(step, { force = false } = {}) {
+  if (!step) return;
+  const remove = () => {
+    if (!force && step.classList.contains("expanded")) return;
+    if (
+      force &&
+      step.classList.contains("expanded") &&
+      step.closest(".process-group")?.classList.contains("expanded")
+    ) {
+      return;
+    }
+    step
+      .querySelector(":scope > .process-step-detail > .process-step-detail-scroll")
+      ?.remove();
+  };
+
+  if (isMassRender()) remove();
+  else setTimeout(remove, 250);
 }
 
 function adjustStepContent(content) {
@@ -482,15 +1610,28 @@ function toggleStepCollapse(step, expanded) {
   }
   nextExpanded = Boolean(nextExpanded);
 
-  // scroll to top when collapsing
-  if (!nextExpanded) {
-    setTimeout(() => {
-      const scroller = step.querySelector(".process-step-detail-scroll");
-      if (scroller) scroller.scrollTop = 0;
-    }, 100);
+  step.classList.toggle("expanded", nextExpanded);
+
+  if (nextExpanded) {
+    if (step.querySelector(".process-step-detail-scroll")) return null;
+    return materializeProcessStepDetail(step);
   }
 
-  step.classList.toggle("expanded", nextExpanded);
+  const scroller = step.querySelector(".process-step-detail-scroll");
+  if (scroller) scroller.scrollTop = 0;
+  discardProcessStepDetail(step);
+}
+
+function materializeProcessStepDetail(step) {
+  if (!step || typeof step.__renderDetail !== "function") return null;
+  if (step.__detailRenderPromise) return step.__detailRenderPromise;
+
+  step.__detailRenderPromise = Promise.resolve(step.__renderDetail()).finally(
+    () => {
+      delete step.__detailRenderPromise;
+    },
+  );
+  return step.__detailRenderPromise;
 }
 
 function drawStandaloneMessage({
@@ -597,75 +1738,43 @@ export function _drawMessage({
   bodyDiv.dataset.scrollStabilization = "1";
   const scroller = new Scroller(bodyDiv, { smooth: !isMassRender() });
 
-  // Handle KVPs incrementally
-  drawKvpsIncremental(bodyDiv, kvps, false);
+  const contentText = String(content ?? "");
+  const lazyContent =
+    _windowedRender &&
+    contentText.length + estimateKvpTextSize(kvps) > LAZY_MESSAGE_PREVIEW_CHARS;
+  const contentOptions = {
+    bodyDiv,
+    content: contentText,
+    kvps,
+    contentClasses,
+    markdown,
+    latex,
+    smoothStream,
+  };
 
-  // Handle content
-  if (content && content.trim().length > 0) {
-    if (markdown) {
-      let contentDiv = bodyDiv.querySelector(".msg-content");
-      if (!contentDiv) {
-        contentDiv = document.createElement("div");
-        bodyDiv.appendChild(contentDiv);
-      }
-      contentDiv.className = `msg-content ${contentClasses.join(" ")}`;
-
-      // let spanElement = contentDiv.querySelector("span");
-      // if (!spanElement) {
-      //   spanElement = document.createElement("span");
-      //   contentDiv.appendChild(spanElement);
-      // }
-
-      let processedContent = content;
-      processedContent = convertImageTags(processedContent);
-      processedContent = convertImgFilePaths(processedContent);
-      processedContent = convertFilePaths(processedContent);
-      processedContent = marked.parse(processedContent, { breaks: true });
-      processedContent = convertPathsToLinks(processedContent);
-      processedContent = addBlankTargetsToLinks(processedContent);
-
-      // do a smooth stream if requested
-      if (smoothStream) smoothRender(contentDiv, processedContent);
-      else contentDiv.innerHTML = processedContent;
-
-      // KaTeX rendering for markdown
-      if (latex) {
-        contentDiv.querySelectorAll("latex").forEach((element) => {
-          katex.render(element.innerHTML, element, {
-            throwOnError: false,
-          });
-        });
-      }
-
-      adjustMarkdownRender(contentDiv);
-    } else {
-      let preElement = bodyDiv.querySelector(".msg-content");
-      if (!preElement) {
-        preElement = document.createElement("pre");
-        preElement.classList.add("msg-content", ...contentClasses);
-        preElement.style.whiteSpace = "pre-wrap";
-        preElement.style.wordBreak = "break-word";
-        bodyDiv.appendChild(preElement);
-      } else {
-        // Update classes
-        preElement.className = `msg-content ${contentClasses.join(" ")}`;
-      }
-
-      // let spanElement = preElement.querySelector("span");
-      // if (!spanElement) {
-      //   spanElement = document.createElement("span");
-      //   preElement.appendChild(spanElement);
-      // }
-
-      if (smoothStream) smoothRender(preElement, convertHTML(content));
-      else preElement.innerHTML = convertHTML(content);
-    }
+  if (lazyContent) {
+    messageDiv.classList.add("lazy-content");
+    delete messageDiv.__lazyRenderedExpanded;
+    messageDiv.__renderLazyContent = (expanded) => {
+      if (messageDiv.__lazyRenderedExpanded === Boolean(expanded)) return;
+      messageDiv.__lazyRenderedExpanded = Boolean(expanded);
+      renderStandaloneMessageContent({
+        ...contentOptions,
+        content: expanded
+          ? contentText
+          : `${contentText.slice(0, LAZY_MESSAGE_PREVIEW_CHARS)}\n\n…`,
+        kvps: expanded ? kvps : null,
+        smoothStream: false,
+      });
+    };
+    messageDiv.__renderLazyContent(
+      messageDiv.classList.contains("expanded"),
+    );
   } else {
-    // Remove content if it exists but content is empty
-    const existingContent = bodyDiv.querySelector(".msg-content");
-    if (existingContent) {
-      existingContent.remove();
-    }
+    messageDiv.classList.remove("lazy-content");
+    delete messageDiv.__renderLazyContent;
+    delete messageDiv.__lazyRenderedExpanded;
+    renderStandaloneMessageContent(contentOptions);
   }
 
   // reapply scroll position or reset for collapsed
@@ -676,31 +1785,80 @@ export function _drawMessage({
   return messageDiv;
 }
 
-export function addBlankTargetsToLinks(str) {
-  const doc = new DOMParser().parseFromString(str, "text/html");
+function renderStandaloneMessageContent({
+  bodyDiv,
+  content,
+  kvps,
+  contentClasses,
+  markdown,
+  latex,
+  smoothStream,
+}) {
+  drawKvpsIncremental(bodyDiv, kvps);
+  if (!content || !content.trim()) {
+    bodyDiv.querySelector(".msg-content")?.remove();
+    return;
+  }
 
-  doc.querySelectorAll("a").forEach((anchor) => {
-    const href = anchor.getAttribute("href") || "";
-    if (
-      href.startsWith("#") ||
-      href.trim().toLowerCase().startsWith("javascript")
-    )
-      return;
-    if (
-      !anchor.hasAttribute("target") ||
-      anchor.getAttribute("target") === ""
-    ) {
-      anchor.setAttribute("target", "_blank");
+  if (markdown) {
+    let contentDiv = bodyDiv.querySelector(".msg-content");
+    if (!contentDiv || contentDiv.tagName === "PRE") {
+      contentDiv?.remove();
+      contentDiv = document.createElement("div");
+      bodyDiv.appendChild(contentDiv);
     }
+    contentDiv.className = `msg-content ${contentClasses.join(" ")}`;
 
-    const rel = (anchor.getAttribute("rel") || "").split(/\s+/).filter(Boolean);
-    if (!rel.includes("noopener")) rel.push("noopener");
-    if (!rel.includes("noreferrer")) rel.push("noreferrer");
-    anchor.setAttribute("rel", rel.join(" "));
-  });
-  return doc.body.innerHTML;
+    let processedContent = content;
+    if (latex) processedContent = convertLatexDelimiters(processedContent);
+    processedContent = convertImageTags(processedContent);
+    processedContent = convertImgFilePaths(processedContent);
+    processedContent = convertFilePaths(processedContent);
+    processedContent = marked.parse(processedContent, { breaks: true });
+    processedContent = sanitizeHtml(processedContent, {
+      allowDataImages: true,
+      allowLatex: latex,
+    });
+    processedContent = convertPathsToLinks(processedContent);
+    processedContent = addBlankTargetsToLinks(processedContent);
+
+    if (smoothStream) smoothRender(contentDiv, processedContent);
+    else contentDiv.innerHTML = processedContent;
+
+    if (latex) renderLatexElements(contentDiv);
+    adjustMarkdownRender(contentDiv);
+    return;
+  }
+
+  let preElement = bodyDiv.querySelector(".msg-content");
+  if (!preElement || preElement.tagName !== "PRE") {
+    preElement?.remove();
+    preElement = document.createElement("pre");
+    preElement.style.whiteSpace = "pre-wrap";
+    preElement.style.wordBreak = "break-word";
+    bodyDiv.appendChild(preElement);
+  }
+  preElement.className = `msg-content ${contentClasses.join(" ")}`;
+
+  if (smoothStream) smoothRender(preElement, convertHTML(content));
+  else preElement.innerHTML = convertHTML(content);
 }
 
+function estimateKvpTextSize(kvps) {
+  if (!kvps) return 0;
+  try {
+    return JSON.stringify(kvps)?.length || 0;
+  } catch {
+    return LAZY_MESSAGE_PREVIEW_CHARS + 1;
+  }
+}
+
+export { addBlankTargetsToLinks };
+
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageDefault({
   id,
   heading,
@@ -711,12 +1869,12 @@ export function drawMessageDefault({
   const contentText = String(content ?? "");
   const actionButtons = contentText.trim()
     ? [
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
-  return drawStandaloneMessage({
+  const element = drawStandaloneMessage({
     id,
     heading,
     content,
@@ -728,21 +1886,38 @@ export function drawMessageDefault({
     kvps,
     actionButtons,
   });
+
+  return { element };
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageAgent({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps = undefined,
+  timestamp = undefined,
   agentno = 0,
   ...additional
 }) {
   const title = cleanStepTitle(heading);
+  const reservedKeys = new Set(["thoughts", "step", "reasoning", "tool_name", "tool_args", "args", "headline"]);
   let displayKvps = {};
   if (kvps?.thoughts) displayKvps["icon://lightbulb[Thoughts]"] = kvps.thoughts;
+  const isResponse = kvps?.tool_name === "response";
+  if (preferencesStore.showToolArgs && !isResponse) {
+    if (kvps?.tool_name) displayKvps["icon://build[Tool]"] = kvps.tool_name;
+    const toolArgs = kvps?.tool_args ?? kvps?.args;
+    if (toolArgs) {
+      Object.entries(toolArgs).forEach(([key, value]) => {
+        if (!reservedKeys.has(key)) displayKvps[key] = value;
+      });
+    }
+  }
   if (kvps?.step) displayKvps["icon://step[Step]"] = kvps.step;
   const thoughtsText = String(kvps?.thoughts ?? "");
   const headerLabels = [
@@ -758,31 +1933,37 @@ export function drawMessageAgent({
 
   if (thoughtsText.trim()) {
     actionButtons.push(
-      createActionButton("speak", "", () => speechStore.speak(thoughtsText)),
+      createActionButton("copy", "", () => copyToClipboard(thoughtsText)),
     );
     actionButtons.push(
-      createActionButton("copy", "", () => copyToClipboard(thoughtsText)),
+      createActionButton("speak", "", () => ttsService.speak(thoughtsText)),
     );
   }
 
-  return drawProcessStep({
+  const result = drawProcessStep({
     id,
     title,
     code: "GEN",
-    classes: null,
+    classes: undefined,
     kvps: displayKvps,
     actionButtons,
     log: arguments[0],
   });
+  if (result.kvpsTable) renderLatexText(result.kvpsTable);
+  return result;
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageResponse({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps = undefined,
+  timestamp = undefined,
   agentno = 0,
   ...additional
 }) {
@@ -792,8 +1973,8 @@ export function drawMessageResponse({
     const contentText = String(content ?? "");
     const actionButtons = contentText.trim()
       ? [
-          createActionButton("speak", "", () => speechStore.speak(contentText)),
           createActionButton("copy", "", () => copyToClipboard(contentText)),
+          createActionButton("speak", "", () => ttsService.speak(contentText)),
         ].filter(Boolean)
       : [];
     return drawProcessStep({
@@ -814,8 +1995,13 @@ export function drawMessageResponse({
   // response of agent 0, render as response to user
   // get last process group or create new container (if first message)
 
-  const group = getLastProcessGroup();
-  let container = document.getElementById(`message-${id}`); // first check for already existing message
+  let group = getLastProcessGroup();
+  if (group?.classList.contains("utility-only")) {
+    group.setAttribute("data-group-complete", "true");
+    updateProcessGroupHeader(group);
+    group = null;
+  }
+  let container = getChatHistoryElementById(`message-${id}`); // first check for already existing message
 
 
   // if no container found, add to previous process group if exists
@@ -844,9 +2030,9 @@ export function drawMessageResponse({
 
   const messageDiv = _drawMessage({
     messageContainer: container,
-    heading: null,
+    heading: undefined,
     content,
-    kvps: null,
+    kvps: undefined,
     messageClasses: [],
     contentClasses: [],
     markdown: true,
@@ -859,8 +2045,8 @@ export function drawMessageResponse({
   const responseText = String(content ?? "");
   const responseActionButtons = responseText.trim()
     ? [
-        createActionButton("speak", "", () => speechStore.speak(responseText)),
         createActionButton("copy", "", () => copyToClipboard(responseText)),
+        createActionButton("speak", "", () => ttsService.speak(responseText)),
       ].filter(Boolean)
     : [];
   setupCollapsible(
@@ -872,9 +2058,29 @@ export function drawMessageResponse({
 
   if (group) updateProcessGroupHeader(group);
 
-  return container;
+  return { element: container };
 }
 
+export function drawMessageModelSetupGate({ id }) {
+  const container = getOrCreateMessageContainer(id, "left");
+  container.classList.add("model-setup-gate-container");
+  container.innerHTML = "";
+
+  const messageDiv = document.createElement("div");
+  messageDiv.className = "message message-agent-response model-setup-gate-message";
+
+  const component = document.createElement("x-component");
+  component.setAttribute("path", "chat/model-setup-gate.html");
+  messageDiv.appendChild(component);
+  container.appendChild(messageDiv);
+
+  return { element: container };
+}
+
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageUser({
   id,
   heading,
@@ -974,6 +2180,7 @@ export function drawMessageUser({
 
       attachmentDiv.addEventListener("click", displayInfo.clickHandler);
 
+      // @ts-ignore
       attachmentsContainer.appendChild(attachmentDiv);
     });
   } else {
@@ -997,29 +2204,32 @@ export function drawMessageUser({
   const userText = String(content ?? "");
   const userActionButtons = userText.trim()
     ? [
-        createActionButton("speak", "", () => speechStore.speak(userText)),
         createActionButton("copy", "", () => copyToClipboard(userText)),
+        createActionButton("speak", "", () => ttsService.speak(userText)),
       ].filter(Boolean)
     : [];
-  const actionButtonsContainer = ensureChild(
+  setupCollapsible(
     messageDiv,
-    ".step-action-buttons",
-    "div",
-    "step-action-buttons",
+    ":scope > .step-action-buttons",
+    false,
+    userActionButtons,
+    ":scope > .message-text",
   );
-  actionButtonsContainer.textContent = "";
-  userActionButtons.forEach((button) =>
-    actionButtonsContainer.appendChild(button),
-  );
+
+  return { element: messageContainer };
 }
 
-export function drawMessageTool({
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {Promise<MessageHandlerResult>}
+ */
+export async function drawMessageTool({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps,
+  timestamp,
   agentno = 0,
   ...additional
 }) {
@@ -1028,27 +2238,41 @@ export function drawMessageTool({
   if (!tool_name) {
     return drawMessageToolSimple({ ...arguments[0] });
   } else if (kvps._tool_name === "skills_tool") {
-    return drawMessageToolSimple({ ...arguments[0], code: "SKL" });
+    const displayKvps = { ...(kvps || {}) };
+    delete displayKvps._tool_name;
+    return drawMessageToolSimple({ ...arguments[0], code: "SKL", displayKvps });
   } else if (kvps._tool_name === "vision_load") {
     return drawMessageToolSimple({ ...arguments[0], code: "EYE" });
   } else if (kvps._tool_name === "search_engine") {
     return drawMessageToolSimple({ ...arguments[0], code: "WEB" });
-  } else if (kvps._tool_name === "browser_agent") {
-    return drawMessageToolSimple({ ...arguments[0], code: "WWW" });
   } else if (kvps._tool_name.startsWith("memory_")) {
     return drawMessageToolSimple({ ...arguments[0], code: "MEM" });
-  } else {
-    return drawMessageToolSimple({ ...arguments[0] });
   }
+
+  /** @type {{ tool_name: string, kvps: any, handler: Function | undefined }} */
+  const extData = {
+    tool_name,
+    kvps,
+    handler: undefined,
+  };
+  await callJsExtensions("get_tool_message_handler", extData);
+  if (typeof extData.handler === "function") {
+    return extData.handler(arguments[0]);
+  }
+  return drawMessageToolSimple({ ...arguments[0] });
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageToolSimple({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps,
+  timestamp,
   agentno = 0,
   code,
   displayKvps,
@@ -1067,8 +2291,8 @@ export function drawMessageToolSimple({
             buildDetailPayload(arguments[0], { headerLabels }),
           ),
         ),
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
@@ -1076,7 +2300,7 @@ export function drawMessageToolSimple({
     id,
     title,
     code: code || "USE",
-    classes: null,
+    classes: undefined,
     kvps: displayKvps,
     content,
     // contentClasses: [],
@@ -1085,115 +2309,17 @@ export function drawMessageToolSimple({
   });
 }
 
-export function drawMessageCodeExe({
-  id,
-  type,
-  heading,
-  content,
-  kvps = null,
-  timestamp = null,
-  agentno = 0,
-  ...additional
-}) {
-  let title = "Code Execution";
-  // show command at the start and end
-  if (kvps?.code && /done_all|code_execution_tool/.test(heading || "")) {
-    const s = kvps.session;
-    title = `${s != null ? `[${s}] ` : ""}${kvps.runtime || "bash"}> ${kvps.code.trim()}`;
-  } else {
-    // during execution show the original heading (current step)
-    title = cleanStepTitle(heading);
-  }
-
-  // KVPS to show
-  const displayKvps = {};
-  // if (kvps?.runtime) displayKvps.runtime = kvps.runtime;
-  // if (kvps?.session>=0) displayKvps.session = kvps.session;
-
-  const headerLabels = [
-    kvps?.runtime && { label: kvps.runtime, class: "tool-name-badge" },
-    kvps?.session != null && {
-      label: `Session ${kvps.session}`,
-      class: "header-label",
-    },
-  ].filter(Boolean);
-
-  // render the standard step
-  const commandText = String(kvps?.code ?? "");
-  const outputText = String(content ?? "");
-  const actionButtons = [
-    createActionButton("detail", "", () =>
-      stepDetailStore.showStepDetail(
-        buildDetailPayload(arguments[0], { headerLabels }),
-      ),
-    ),
-    commandText.trim()
-      ? createActionButton("copy", "Command", () =>
-          copyToClipboard(commandText),
-        )
-      : null,
-    outputText.trim()
-      ? createActionButton("copy", "Output", () => copyToClipboard(outputText))
-      : null,
-  ].filter(Boolean);
-  const stepData = drawProcessStep({
-    id,
-    title,
-    code: "EXE",
-    classes: null,
-    kvps: displayKvps,
-    content,
-    contentClasses: ["terminal-output"],
-    actionButtons,
-    log: arguments[0],
-  });
-}
-
-export function drawMessageBrowser({
-  id,
-  type,
-  heading,
-  content,
-  kvps = null,
-  timestamp = null,
-  agentno = 0,
-  ...additional
-}) {
-  const title = cleanStepTitle(heading);
-  let displayKvps = { ...kvps };
-  const answerText = String(kvps?.answer ?? "");
-  const actionButtons = answerText.trim()
-    ? [
-        createActionButton("detail", "", () =>
-          stepDetailStore.showStepDetail(
-            buildDetailPayload(arguments[0], { headerLabels: [] }),
-          ),
-        ),
-        createActionButton("speak", "", () => speechStore.speak(answerText)),
-        createActionButton("copy", "", () => copyToClipboard(answerText)),
-      ].filter(Boolean)
-    : [];
-
-  return drawProcessStep({
-    id,
-    title,
-    code: "WWW",
-    classes: null,
-    kvps: displayKvps,
-    content,
-    // contentClasses: [],
-    actionButtons,
-    log: arguments[0],
-  });
-}
-
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageMcp({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps,
+  timestamp,
   agentno = 0,
   ...additional
 }) {
@@ -1210,8 +2336,8 @@ export function drawMessageMcp({
             buildDetailPayload(arguments[0], { headerLabels }),
           ),
         ),
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
@@ -1219,7 +2345,7 @@ export function drawMessageMcp({
     id,
     title,
     code: "MCP",
-    classes: null,
+    classes: undefined,
     kvps: displayKvps,
     content,
     // contentClasses: [],
@@ -1228,13 +2354,17 @@ export function drawMessageMcp({
   });
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageSubagent({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps,
+  timestamp,
   agentno = 0,
   ...additional
 }) {
@@ -1251,8 +2381,8 @@ export function drawMessageSubagent({
             buildDetailPayload(arguments[0], { headerLabels }),
           ),
         ),
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
@@ -1260,7 +2390,7 @@ export function drawMessageSubagent({
     id,
     title,
     code: "SUB",
-    classes: null,
+    classes: undefined,
     kvps: displayKvps,
     content,
     // contentClasses: [],
@@ -1269,43 +2399,55 @@ export function drawMessageSubagent({
   });
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageInfo({
   id,
   heading,
   content,
-  kvps = null,
+  kvps,
   ...additional
 }) {
   const title = cleanStepTitle(heading || content);
   let displayKvps = { ...kvps };
+  delete displayKvps.finished;
   const contentText = String(content ?? "");
   const actionButtons = contentText.trim()
     ? [
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
-  return drawProcessStep({
+  const result = drawProcessStep({
     id,
     title,
     code: "INF",
-    classes: null,
+    classes: undefined,
     kvps: displayKvps,
     content,
     // contentClasses: [],
     actionButtons,
     log: arguments[0],
   });
+
+  if (kvps?.finished) completeLastProcessGroup();
+  return result;
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageUtil({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps,
+  timestamp,
   agentno = 0,
   ...additional
 }) {
@@ -1313,8 +2455,8 @@ export function drawMessageUtil({
   const contentText = String(content ?? "");
   const actionButtons = contentText.trim()
     ? [
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
@@ -1327,20 +2469,24 @@ export function drawMessageUtil({
     content,
     actionButtons,
     log: arguments[0],
-    allowCompletedGroup: true,
+    allowCompletedGroup: false,
   });
 
   result.dontScroll = !preferencesStore.showUtils;
   return result;
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageHint({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps,
+  timestamp,
   agentno = 0,
   ...additional
 }) {
@@ -1348,33 +2494,38 @@ export function drawMessageHint({
   const contentText = String(content ?? "");
   const actionButtons = contentText.trim()
     ? [
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
-  return drawStandaloneMessage({
+  const element = drawStandaloneMessage({
     id,
-    title,
+    heading: title,
     // statusClass,
-    statusCode: "HNT",
+    // statusCode: "HNT",
     kvps,
-    type,
-    heading,
+    // type,
     content,
-    timestamp,
-    agentno,
+    // timestamp,
+    // agentno,
     actionButtons,
   });
+
+  return { element };
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageProgress({
   id,
   type,
   heading,
   content,
-  kvps = null,
-  timestamp = null,
+  kvps,
+  timestamp,
   agentno = 0,
   ...additional
 }) {
@@ -1385,7 +2536,7 @@ export function drawMessageProgress({
     id,
     title,
     code: "HDL",
-    classes: null,
+    classes: undefined,
     kvps: displayKvps,
     content,
     // contentClasses: [],
@@ -1394,6 +2545,10 @@ export function drawMessageProgress({
   });
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageWarning({
   id,
   type,
@@ -1407,14 +2562,16 @@ export function drawMessageWarning({
   const contentText = String(content ?? "");
   const actionButtons = contentText.trim()
     ? [
-        createActionButton("speak", "", () => speechStore.speak(contentText)),
         createActionButton("copy", "", () => copyToClipboard(contentText)),
+        createActionButton("speak", "", () => ttsService.speak(contentText)),
       ].filter(Boolean)
     : [];
 
-  //if process group is running, append there
-  const group = getLastProcessGroup(false);
-  if (group) {
+  // Keep replayed warnings in their classified process group.
+  if (
+    arguments[0][PROCESS_GROUP_RENDER_INFO] ||
+    getLastProcessGroup(false)
+  ) {
     return drawProcessStep({
       id,
       title,
@@ -1429,9 +2586,9 @@ export function drawMessageWarning({
   }
 
   // if no process group is running, draw as standalone
-  return drawStandaloneMessage({
+  const element = drawStandaloneMessage({
     id,
-    title,
+    heading: title,
     content,
     position: "mid",
     containerClasses: ["ai-container", "center-container"],
@@ -1439,8 +2596,14 @@ export function drawMessageWarning({
     kvps: displayKvps,
     actionButtons,
   });
+
+  return { element };
 }
 
+/**
+ * @param {MessageHandlerArgs & Record<string, any>} param0
+ * @returns {MessageHandlerResult}
+ */
 export function drawMessageError({
   id,
   type,
@@ -1452,18 +2615,22 @@ export function drawMessageError({
   const contentText = String(content ?? "");
   let title = getStepTitle(heading, content, type);
   let displayKvps = { ...kvps };
-  const actionButtons = [
+
+  const actionButtons = [];
+  actionButtons.push(
     createActionButton("detail", "", () =>
       stepDetailStore.showStepDetail(
         buildDetailPayload(arguments[0], { headerLabels: [] }),
       ),
     ),
-    contentText.trim()
-      ? createActionButton("copy", "", () => copyToClipboard(contentText))
-      : null,
-  ].filter(Boolean);
+  );
+  if (contentText.trim()) {
+    actionButtons.push(
+      createActionButton("copy", "", () => copyToClipboard(contentText)),
+    );
+  }
 
-  return drawStandaloneMessage({
+  const element = drawStandaloneMessage({
     id,
     heading: title,
     content: contentText,
@@ -1473,9 +2640,11 @@ export function drawMessageError({
     kvps: displayKvps,
     actionButtons,
   });
+
+  return { element };
 }
 
-function drawKvpsIncremental(container, kvps, latex) {
+function drawKvpsIncremental(container, kvps) {
   // existing KVPS table
   let table = container.querySelector(".msg-kvps");
   if (kvps) {
@@ -1483,7 +2652,7 @@ function drawKvpsIncremental(container, kvps, latex) {
     if (!table) {
       table = document.createElement("table");
       table.classList.add("msg-kvps");
-      container.appendChild(table);
+      container.insertBefore(table, container.firstChild);
     }
 
     // Get all current rows for comparison
@@ -1558,7 +2727,7 @@ function drawKvpsIncremental(container, kvps, latex) {
       if (typeof value === "string" && value.startsWith("img://")) {
         const imgElement = document.createElement("img");
         imgElement.classList.add("kvps-img");
-        imgElement.src = value.replace("img://", "/image_get?path=");
+        imgElement.src = value.replace("img://", "/api/image_get?path=");
         imgElement.alt = "Image Attachment";
         tdiv.appendChild(imgElement);
 
@@ -1571,15 +2740,6 @@ function drawKvpsIncremental(container, kvps, latex) {
         const span = document.createElement("p");
         span.innerHTML = convertHTML(value);
         tdiv.appendChild(span);
-
-        // KaTeX rendering for markdown
-        if (latex) {
-          span.querySelectorAll("latex").forEach((element) => {
-            katex.render(element.innerHTML, element, {
-              throwOnError: false,
-            });
-          });
-        }
       }
     }
   } else {
@@ -1623,12 +2783,47 @@ function convertHTML(str) {
   return result;
 }
 
+function convertLatexDelimiters(content) {
+  return content.replace(
+    /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)|\\\[([\s\S]*?)\\\]|\\\(([\s\S]*?)\\\)|\$\$([\s\S]*?)\$\$/g,
+    (match, code, display, inline, dollars) => {
+      if (code) return code;
+      const tex = display ?? inline ?? dollars;
+      const displayAttribute =
+        display !== undefined || dollars !== undefined
+          ? ' data-display="true"'
+          : "";
+      const encodedTex = Array.from(
+        tex.trim(),
+        (char) => `&#${char.codePointAt(0)};`,
+      ).join("");
+      return `<latex${displayAttribute}>${encodedTex}</latex>`;
+    },
+  );
+}
+
+function renderLatexElements(container) {
+  container.querySelectorAll("latex").forEach((element) => {
+    globalThis.katex.render(element.textContent, element, {
+      displayMode: element.dataset.display === "true",
+      throwOnError: false,
+    });
+  });
+}
+
+function renderLatexText(container) {
+  globalThis.renderMathInElement(container, {
+    throwOnError: false,
+    errorCallback: () => {},
+  });
+}
+
 function convertImgFilePaths(str) {
-  return str.replace(/img:\/\//g, "/image_get?path=");
+  return str.replace(/img:\/\//g, "/api/image_get?path=");
 }
 
 function convertFilePaths(str) {
-  return str.replace(/file:\/\//g, "/download_work_dir_file?path=");
+  return str.replace(/file:\/\//g, "/api/download_work_dir_file?path=");
 }
 
 function escapeHTML(str) {
@@ -1643,29 +2838,32 @@ function escapeHTML(str) {
 }
 
 function convertPathsToLinks(str) {
-  function generateLinks(match) {
-    const parts = match.split("/");
+  function generateLinks(match, path) {
+    const parts = path.split("/");
     if (!parts[0]) parts.shift(); // drop empty element left of first "
     let conc = "";
     let html = "";
     for (const part of parts) {
       conc += "/" + part;
-      html += `/<a href="#" class="path-link" onclick="openFileLink('${conc}');">${part}</a>`;
+      html += `/<a href="#" class="path-link" data-path="${conc}" onclick="event.preventDefault(); openFileLink(this.dataset.path);">${part}</a>`;
     }
     return html;
   }
 
   const prefix = `(?:^|[> \`'"\\n]|&#39;|&quot;)`;
+  const pathPart = `[a-zA-Z0-9_.~@%+=,()\\-]+(?: [a-zA-Z0-9_.~@%+=,()\\-]+)*`;
+  const spacedFilePath = `\\/(?:${pathPart}\\/)*${pathPart}\\.[a-zA-Z0-9]{1,12}`;
   const folder = `[a-zA-Z0-9_\\/.\\-]`;
   const file = `[a-zA-Z0-9_\\-\\/]`;
-  const suffix = `(?<!\\.)`;
+  const simplePath = `\\/${folder}*${file}(?<!\\.)`;
+  const suffix = `(?=$|[\\s.,;:!?\\)\\]\\}]|&#39;|&quot;)`;
   const pathRegex = new RegExp(
-    `(?<=${prefix})\\/${folder}*${file}${suffix}`,
+    `(?<=${prefix})(?:file:\\/\\/|\\/api\\/download_work_dir_file\\?path=)?(${spacedFilePath}|${simplePath})${suffix}`,
     "g",
   );
 
-  // skip paths inside html tags, like <img src="/path/to/image">
-  const tagRegex = /(<(?:[^<>"']+|"[^"]*"|'[^']*')*>)/g;
+  // Preserve existing links and code blocks as well as HTML attributes.
+  const tagRegex = /(<a\b[^>]*>[\s\S]*?<\/a>|<pre\b[^>]*>[\s\S]*?<\/pre>|<(?:[^<>"']+|"[^"]*"|'[^']*')*>)/gi;
 
   return str
     .split(tagRegex) // keep tags & text separate
@@ -1773,17 +2971,37 @@ function createProcessGroup(id) {
     <span class="group-title">Processing...</span>
     <span class="step-badge GEN">GEN</span>
     <span class="group-metrics">
-      <span class="metric-time" title="Start time"><span class="material-symbols-outlined">schedule</span><span class="metric-value">--:--</span></span>
-      <span class="metric-steps display-none" title="Steps"><span class="material-symbols-outlined">footprint</span><span class="metric-value">0</span></span>
-      <span class="metric-notifications" title="Warnings/Info/Hint" hidden><span class="material-symbols-outlined">priority_high</span><span class="metric-value">0</span></span>
-      <span class="metric-duration display-none" title="Duration"><span class="material-symbols-outlined">timer</span><span class="metric-value">--</span></span>
+      <span class="metric-time" title="Start time"><x-icon name="schedule"></x-icon><span class="metric-value">--:--</span></span>
+      <span class="metric-steps display-none" title="Steps"><x-icon name="footprint"></x-icon><span class="metric-value">0</span></span>
+      <span class="metric-notifications" title="Warnings/Info/Hint" hidden><x-icon name="priority_high"></x-icon><span class="metric-value">0</span></span>
+      <span class="metric-duration display-none" title="Duration"><x-icon name="timer"></x-icon><span class="metric-value">--</span></span>
 
     </span>
   `;
 
+  group.__setExpanded = (expanded) => {
+    const nextExpanded = Boolean(expanded);
+    group.classList.toggle("expanded", nextExpanded);
+    const steps = group.querySelectorAll(".process-step");
+    if (nextExpanded) {
+      steps.forEach((step) => {
+        if (
+          step.classList.contains("expanded") &&
+          !step.querySelector(".process-step-detail-scroll")
+        ) {
+          void materializeProcessStepDetail(step);
+        }
+      });
+    } else {
+      steps.forEach((step) =>
+        discardProcessStepDetail(step, { force: true }),
+      );
+    }
+  };
+
   // Add click handler for expansion
   header.addEventListener("click", () => {
-    group.classList.toggle("expanded");
+    group.__setExpanded(!group.classList.contains("expanded"));
   });
 
   group.appendChild(header);
@@ -1948,7 +3166,7 @@ export function convertIcons(html, classes = "") {
     /icon:\/\/([a-zA-Z0-9_]+)(\[(?:\\.|[^\]])*\])?/g,
     (match, iconName, tooltipBlock) => {
       if (!tooltipBlock) {
-        return `<span class="icon material-symbols-outlined ${classes}">${iconName}</span>`;
+        return `<x-icon class="icon ${classes}" name="${iconName}"></x-icon>`;
       }
 
       const tooltipRaw = tooltipBlock
@@ -1959,7 +3177,7 @@ export function convertIcons(html, classes = "") {
 
       const tooltip = escapeHTML(tooltipRaw);
 
-      return `<span class="icon material-symbols-outlined ${classes}" title="${tooltip}" data-bs-placement="top" data-bs-trigger="hover">${iconName}</span>`;
+      return `<x-icon class="icon ${classes}" title="${tooltip}" data-bs-placement="top" data-bs-trigger="hover" name="${iconName}"></x-icon>`;
     },
   );
 }
@@ -1968,7 +3186,7 @@ export function convertIcons(html, classes = "") {
  * Clean step title by removing icon:// prefixes and status phrases
  * Preserves agent markers (A1:, A2:, etc.) so users can see which subordinate agent is executing
  */
-function cleanStepTitle(text, maxLength = 100) {
+export function cleanStepTitle(text, maxLength = 100) {
   if (!text) return "";
   let cleaned = String(text)
     .replace(/icon:\/\/[a-zA-Z0-9_]+(\[(?:\\.|[^\]])*\])?\s*/g, "")
@@ -2030,10 +3248,13 @@ function updateProcessGroupHeader(group) {
   const stepsMetricValEl =
     stepMetricContainerEl?.querySelector(".metric-value");
   if (stepsMetricValEl) {
-    let genSteps = group.querySelectorAll(
-      '.process-step[data-log-type="agent"]',
-    ).length;
-    genSteps -= 1; // don't count response as step
+    let genSteps = Number(group.dataset.fullAgentSteps);
+    if (!Number.isFinite(genSteps)) {
+      genSteps = group.querySelectorAll(
+        '.process-step[data-log-type="agent"]',
+      ).length;
+      genSteps -= 1; // don't count response as step
+    }
     stepsMetricValEl.textContent = genSteps.toString();
     if (genSteps <= 0)
       stepMetricContainerEl.classList.add("display-none"); // hide when no steps
@@ -2046,27 +3267,29 @@ function updateProcessGroupHeader(group) {
   const startTimestamp = group.getAttribute("data-start-timestamp");
   if (timeMetricEl && startTimestamp) {
     const date = new Date(parseFloat(startTimestamp) * 1000);
-    const hours = String(date.getHours()).padStart(2, "0");
-    const minutes = String(date.getMinutes()).padStart(2, "0");
-    timeMetricEl.textContent = `${hours}:${minutes}`;
+    const hour12 = getUserHour12();
+    timeMetricEl.textContent = new Intl.DateTimeFormat(undefined, {
+      hour: hour12 ? "numeric" : "2-digit",
+      minute: "2-digit",
+      hour12,
+      timeZone: getUserTimezone(),
+    }).format(date);
     if (timeMetricContainerEl) {
-      const fullDateTime = date.toLocaleString(undefined, {
-        dateStyle: "medium",
-        timeStyle: "short",
-      });
+      const fullDateTime = formatDateTime(date.toISOString(), "short");
       timeMetricContainerEl.title =
         timeMetricContainerEl.dataset.bsOriginalTitle = fullDateTime;
     }
   }
 
-  const firstTimestampMs = parseInt(
-    steps[0]?.getAttribute("data-timestamp") || "0",
-    10,
-  );
-  const lastTimestampMs = parseInt(
-    steps[steps.length - 1]?.getAttribute("data-timestamp") || "0",
-    10,
-  );
+  const firstTimestampMs = group.dataset.fullStartTimestamp
+    ? Math.round(Number(group.dataset.fullStartTimestamp) * 1000)
+    : parseInt(steps[0]?.getAttribute("data-timestamp") || "0", 10);
+  const lastTimestampMs = group.dataset.fullEndTimestamp
+    ? Math.round(Number(group.dataset.fullEndTimestamp) * 1000)
+    : parseInt(
+      steps[steps.length - 1]?.getAttribute("data-timestamp") || "0",
+      10,
+    );
   const durationText =
     isCompleted &&
     metricsEl &&
@@ -2087,13 +3310,20 @@ function updateProcessGroupHeader(group) {
   }
 
   if (notificationsEl) {
-    const counts = { warning: 0, info: 0 };
-    steps.forEach((step) => {
-      const stepType = step.getAttribute("data-log-type");
-      if (Object.prototype.hasOwnProperty.call(counts, stepType)) {
-        counts[stepType] += 1;
-      }
-    });
+    const fullWarningSteps = Number(group.dataset.fullWarningSteps);
+    const fullInfoSteps = Number(group.dataset.fullInfoSteps);
+    const counts = Number.isFinite(fullWarningSteps) &&
+        Number.isFinite(fullInfoSteps)
+      ? { warning: fullWarningSteps, info: fullInfoSteps }
+      : { warning: 0, info: 0 };
+    if (!Number.isFinite(fullWarningSteps) || !Number.isFinite(fullInfoSteps)) {
+      steps.forEach((step) => {
+        const stepType = step.getAttribute("data-log-type");
+        if (Object.prototype.hasOwnProperty.call(counts, stepType)) {
+          counts[stepType] += 1;
+        }
+      });
+    }
 
     const totalNotifications = counts.warning + counts.info;
     const countEl = notificationsEl.querySelector(".metric-value");
@@ -2147,8 +3377,16 @@ function truncateText(text, maxLength) {
 }
 
 // gets or creates a child DOM element
+/**
+ * @param {Element} parent
+ * @param {string} selector
+ * @param {string} tagName
+ * @param {...string} classNames
+ * @returns {HTMLElement}
+ */
 function ensureChild(parent, selector, tagName, ...classNames) {
-  let el = parent.querySelector(selector);
+  /** @type {HTMLElement | null} */
+  let el = /** @type {any} */ (parent.querySelector(selector));
   if (!el) {
     el = document.createElement(tagName);
     if (classNames.length) el.classList.add(...classNames);
@@ -2163,9 +3401,17 @@ function setupCollapsible(
   containerSelector,
   initialExpanded,
   actionButtons = [],
+  contentSelector = ":scope > .message-body",
 ) {
   messageDiv.classList.add("message-collapsible");
-  messageDiv.classList.toggle("expanded", initialExpanded);
+  messageDiv
+    .querySelectorAll(":scope > .message-collapse-content")
+    .forEach((element) => element.classList.remove("message-collapse-content"));
+  const collapseContent = messageDiv.querySelector(contentSelector);
+  collapseContent?.classList.add("message-collapse-content");
+  const initialState =
+    Boolean(initialExpanded) && !messageDiv.classList.contains("lazy-content");
+  messageDiv.classList.toggle("expanded", initialState);
 
   const container = ensureChild(
     messageDiv,
@@ -2173,8 +3419,6 @@ function setupCollapsible(
     "div",
     "step-action-buttons",
   );
-  container.textContent = "";
-
   const btn = ensureChild(container, ".expand-btn", "button", "expand-btn");
   const syncBtn = () => {
     const exp = messageDiv.classList.contains("expanded");
@@ -2182,29 +3426,51 @@ function setupCollapsible(
     btn.classList.toggle("show-less-btn", exp);
     btn.classList.toggle("show-more-btn", !exp);
   };
-  syncBtn();
-  btn.onclick = () => {
-    messageDiv.classList.toggle("expanded");
+  const setExpanded = (expanded) => {
+    const nextExpanded = Boolean(expanded);
+    messageDiv.classList.toggle("expanded", nextExpanded);
+    messageDiv.__renderLazyContent?.(nextExpanded);
     syncBtn();
-    messageDiv.classList.contains("expanded") ||
-      (messageDiv.querySelector(".message-body").scrollTop = 0);
+    if (!nextExpanded) {
+      if (collapseContent) collapseContent.scrollTop = 0;
+    }
   };
+  messageDiv.__setExpanded = setExpanded;
+  setExpanded(initialState);
+  btn.onclick = () =>
+    setExpanded(!messageDiv.classList.contains("expanded"));
 
-  actionButtons.filter(Boolean).forEach((b) => container.appendChild(b));
+  syncActionButtons(container, actionButtons);
 
-  // Detect overflow after render
+  const refreshOverflow = () => {
+    const hasOverflow = measureMessageCollapseOverflow(collapseContent, {
+      expanded: messageDiv.classList.contains("expanded"),
+      lazy: messageDiv.classList.contains("lazy-content"),
+    });
+    if (hasOverflow === null) return false;
+    messageDiv.classList.toggle("has-overflow", hasOverflow);
+    return true;
+  };
+  messageDiv.__refreshCollapseOverflow = refreshOverflow;
+
+  // Detect overflow after render. Window replays are measured again after the
+  // staged DOM has moved into the live, correctly sized chat history.
   requestAnimationFrame(() => {
-    const body = messageDiv.querySelector(".message-body");
-    const fontSize = parseFloat(
-      getComputedStyle(body || document.documentElement).fontSize || "16",
-    );
-    const maxHeight = messageDiv.classList.contains("expanded")
-      ? fontSize * 15
-      : body?.clientHeight || 0;
-    messageDiv.classList.toggle(
-      "has-overflow",
-      (body?.scrollHeight || 0) > maxHeight,
-    );
+    if (messageDiv.__refreshCollapseOverflow === refreshOverflow) {
+      refreshOverflow();
+    }
+  });
+}
+
+function refreshCollapsibleMessageOverflow(root) {
+  if (!root) return;
+  const messages = root.matches?.(".message-collapsible")
+    ? [root]
+    : root.querySelectorAll?.(".message-collapsible") || [];
+  messages.forEach((message) => {
+    if (typeof message.__refreshCollapseOverflow === "function") {
+      message.__refreshCollapseOverflow();
+    }
   });
 }
 
